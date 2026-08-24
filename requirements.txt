@@ -1,0 +1,12 @@
+duckdb>=1.4
+pyarrow>=17
+numpy>=1.26
+pandas>=2.2
+psutil>=6
+pyyaml>=6
+pydantic>=2
+pytest>=8
+# Assignment A05's tool-bridge task only (add it when you get there):
+# pandera>=0.24
+# Assignment A15 only (big install; add it when you get there):
+# dbt-duckdb>=1.11

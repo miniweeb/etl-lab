@@ -1,0 +1,18 @@
+# data never lives in the repo
+data/
+*.duckdb
+*.duckdb.wal
+tmp/
+quarantine/
+
+# python
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+venv/
+
+# dbt (A15)
+**/target/
+**/dbt_packages/
+logs/
