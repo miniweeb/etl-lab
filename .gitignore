@@ -16,3 +16,6 @@ venv/
 **/target/
 **/dbt_packages/
 logs/
+
+# notebooks
+.ipynb_checkpoints/
