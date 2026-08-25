@@ -1,4 +1,4 @@
-# work/verify_lake.py
+# work/a02_partitioning/a02_verify_lake.py
 """Đối chiếu lake với manifest của bộ sinh dữ liệu.
 
 Chạy:  python -m work.verify_lake
@@ -11,7 +11,7 @@ from pathlib import Path
 import duckdb
 
 BASE = Path(os.environ.get("ETL_LAB_DATA", Path(__file__).resolve().parents[1] / "data"))
-SCALE = "small"                          # Task 6 đổi thành "full"
+SCALE = "full"                          # Task 6 đổi thành "full"
 ROOT = BASE / "small" if SCALE == "small" else BASE
 
 manifest_total = 0

@@ -83,3 +83,60 @@
   Installing packages via `pip install duckdb` in the active terminal `.venv` does not automatically update VS Code's Interactive Window / Jupyter extension if it points to the global Python interpreter (e.g., Python 3.13.13). The kernel must be explicitly switched to `.venv\Scripts\python.exe` or installed using `%pip install` directly within the cell.
 * **Pandas Memory Explosion (2.7x Expansion Factor)**: 
   A 343 MB raw CSV expands to 910 MB in RAM when loaded as a Pandas DataFrame due to Python object overhead. Processing the full 15.7 GB monthly feed via Pandas would demand ~42 GB RAM, triggering Out-Of-Memory (OOM) crashes on 16 GB development machines, highlighting the necessity of streaming/out-of-core engines like DuckDB.
+
+
+# A02 — Hive Partitioning, Late-Arriving Data & Lake Building
+
+### Data Lake Specs & Audit
+* **Raw Files Scope**: 45 CSV files in daily batch feed (`$env:ETL_LAB_DATA\small\raw\orders`)[cite: 5]
+* **Lake Storage Layout**: 
+  * **Directories**: 46 directories (45 date partitions `order_date=YYYY-MM-DD` + 1 `__HIVE_DEFAULT_PARTITION__` for NULL timestamps)[cite: 5]
+  * **File Count & Size**: 377 total Parquet files totaling ~214 MB on disk (small scale)[cite: 5]
+* **Manifest Reconciliation & Build Performance**:
+  * **Small Scale Build**: 26.5 seconds[cite: 5] | Lake count: 2,773,566 vs Manifest: 2,773,566 (`MATCH=True`)[cite: 5]
+  * **Full Scale Build**: 138.5 seconds[cite: 5] | Lake count: 55,471,709 vs Manifest: 55,471,709 (`MATCH=True`)[cite: 5]
+
+---
+
+### Task 1 Analysis: Raw Timestamp Heterogeneity & Late-Arriving Data
+
+Audit of single batch file (`orders_2026-06-10.csv`, total 60,782 rows)[cite: 5]:
+
+| Data Category | Row Count | Description |
+| :--- | :--- | :--- |
+| **Own-Day Events** | 59,857 | Orders placed on `2026-06-10`[cite: 5] |
+| **Late-Arriving Updates** | 911 | Backdated updates spanning prior 7 days (`06-03` to `06-09`)[cite: 5] |
+| **Corrupted Timestamps** | 14 | Unparseable timestamp values evaluating to `NULL`[cite: 5] |
+
+**Format Probe Breakdown (`try_strptime`)**:
+* **3 Formats (`null_3fmt`)**: 14 invalid rows (actual corrupted records)[cite: 5]
+* **2 Formats (`null_2fmt`)**: 222 invalid rows[cite: 5]
+* **Data Loss Delta**: Omitting the ISO-T format (`%Y-%m-%dT%H:%M:%S`) mistakenly drops **208 valid orders** into `NULL`[cite: 5]
+
+---
+
+### Partition Pruning Benchmark (Task 5)
+
+| Metric / Filter Type | Query A: Partition Filter (`order_date = '2026-06-19'`) | Query B: File Content Filter (`CAST(order_ts_clean AS DATE) = '2026-06-19'`) | Performance Efficiency |
+| :--- | :--- | :--- | :--- |
+| **Execution Time (Median)** | **10.5 ms**[cite: 5] | **31.6 ms**[cite: 5] | **~3x faster**[cite: 5] |
+| **Scanned Parquet Files** | **8 / 377 files**[cite: 5] | **377 / 377 files**[cite: 5] | **369 files pruned from I/O**[cite: 5] |
+| **Result Verification** | 180,183 rows (avg store: 267.17)[cite: 5] | 180,183 rows (avg store: 267.17)[cite: 5] | Identical results[cite: 5] |
+
+---
+
+### Key Takeaways & Data Quality Pitfalls
+
+* **Implicit `TRY_CAST` Blindspots**: DuckDB's native `TRY_CAST` silently accepts ISO-T timestamps (`2026-06-02T11:41:17`), masking format variations[cite: 5]. Explicit validation via `try_strptime` with a complete format array is required to prevent accidental data dropping during ingestion[cite: 5].
+* **Hive Default Partitioning**: Non-standard or invalid timestamps (e.g., `2026-06-31`) resolve to `NULL` dates and are isolated in `__HIVE_DEFAULT_PARTITION__`, preserving overall lake integrity without crashing ingestion[cite: 5].
+
+---
+
+### Real-World Surprises & Technical Gotchas
+
+* **The `OVERWRITE_OR_IGNORE` Incident (Data Loss Crisis)**: 
+  When processing daily batch files in `OVERWRITE_OR_IGNORE` mode, incoming batch files containing late corrections for previous days overwrite static filenames (e.g., `data_0.parquet`) in target partition directories[cite: 5]. In testing, processing the June 2nd file erased 60,686 original June 1st rows, leaving only 885 late-arriving records[cite: 5].
+* **UUID-based `APPEND` Resolution**: 
+  Switching the lake ingestion mode to `APPEND` forces DuckDB/Parquet writers to assign unique UUID file names per write batch[cite: 5]. This allows new Parquet files to be added alongside existing files in partition directories without overwriting prior records[cite: 5].
+* **File Fan-out in Early Partition Directories**: 
+  Because daily batch files carry late updates for up to 7 prior days, earlier partition folders end up containing multiple smaller Parquet files (e.g., 8 files per folder for early dates)[cite: 5].

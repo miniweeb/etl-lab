@@ -1,4 +1,8 @@
-# %% work/a02_explore.py
+# %%
+import os
+print(os.environ.get("ETL_LAB_DATA"))
+
+# %% work/a02_partitioning/a02_explore.py
 """A02 — khảo sát: 1 file chứa 8 ngày, khám nghiệm vụ mất dữ liệu, chứng minh pruning."""
 import os
 if os.path.basename(os.getcwd()) == "work":

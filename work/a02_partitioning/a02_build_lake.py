@@ -1,4 +1,4 @@
-# work/build_lake.py
+# work/a02_partitioning/a02_build_lake.py
 """A02 — dựng lake Parquet phân vùng, mỗi lần một ngày.
 
 Chạy:  python -m work.build_lake
@@ -12,7 +12,7 @@ from pathlib import Path
 import duckdb
 
 BASE = Path(os.environ.get("ETL_LAB_DATA", Path(__file__).resolve().parents[1] / "data"))
-SCALE = "small"                          # Task 6 đổi thành "full"
+SCALE = "full"                          # Task 6 đổi thành "full"
 ROOT = BASE / "small" if SCALE == "small" else BASE
 
 RAW_ORDERS = ROOT / "raw" / "orders"
@@ -21,8 +21,8 @@ TMP = ROOT / "tmp"
 
 # ── hai hằng số của cả bài ───────────────────────────────────────────
 FIRST_DAY = date(2026, 6, 1)
-LAST_DAY = date(2026, 6, 2)              # Task 2: 2 ngày | Task 3: date(2026, 7, 15)
-PARTITION_MODE = "OVERWRITE_OR_IGNORE"   # Task 2: cái này | Task 3: "APPEND"
+LAST_DAY = date(2026, 7, 15)              # Task 2: 2 ngày | Task 3: date(2026, 7, 15)
+PARTITION_MODE = "APPEND"   # Task 2: cái này | Task 3: "APPEND"
 
 TS_FORMATS = "['%Y-%m-%d %H:%M:%S', '%d/%m/%Y %H:%M:%S', '%Y-%m-%dT%H:%M:%S']"
 V1_COLUMNS = """{'order_id':'BIGINT','customer_id':'BIGINT','store_id':'INTEGER',
