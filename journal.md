@@ -140,3 +140,80 @@ Audit of single batch file (`orders_2026-06-10.csv`, total 60,782 rows)[cite: 5]
   Switching the lake ingestion mode to `APPEND` forces DuckDB/Parquet writers to assign unique UUID file names per write batch[cite: 5]. This allows new Parquet files to be added alongside existing files in partition directories without overwriting prior records[cite: 5].
 * **File Fan-out in Early Partition Directories**: 
   Because daily batch files carry late updates for up to 7 prior days, earlier partition folders end up containing multiple smaller Parquet files (e.g., 8 files per folder for early dates)[cite: 5].
+
+# A03 — Data Transformation, Cleaning & Enrichment Pipeline
+
+### Data Audit & Environment Specs
+* **Target Date & Scope**: `2026-06-02` batch processing (`$root\raw\orders\orders_2026-06-02.csv`)[cite: 1]
+* **Schema Layout**: 4 isolated schemas (`core`, `marts`, `ops`, `staging`)[cite: 1]
+* **Raw Staging Volume**: 59,024 raw CSV rows ingested (Small Scale)[cite: 1]
+* **Data Quality Anomalies Identified**:
+  * **Excel Float Strings**: 120 rows with trailing `.0` (e.g., `123456.0`)[cite: 1]
+  * **Missing Identifiers**: 94 rows with `NULL` `customer_id`[cite: 1]
+  * **Corrupted Timestamps**: 18 unparseable date strings (e.g., `2026-06-31`)[cite: 1]
+  * **Late-Arriving Records**: 883 rows belonging to `2026-06-01`[cite: 1]
+* **Test Suite Verification**: 7/7 unit tests passed (`pytest` in 1.43s)[cite: 1]
+
+---
+
+### Execution Performance Metrics
+
+| Metric / Process | Small Scale (`--scale small`) | Full Scale (`--scale full`) | Performance Efficiency |
+| :--- | :--- | :--- | :--- |
+| **Raw Ingestion Volume** | 59,024 rows[cite: 1] | 1,180,490 rows[cite: 1] | **20x volume scaling** |
+| **Manifest Audit Match** | 59,024 vs 59,024 (`Match=True`)[cite: 1] | 1,180,490 vs 1,180,490 (`Match=True`)[cite: 1] | **100% reconciliation**[cite: 1] |
+| **Cleaned & Staged Rows** | 58,993 rows[cite: 1] | 1,179,758 rows[cite: 1] | **~99.93% retention**[cite: 1] |
+| **Enriched Orders Volume** | 58,993 rows[cite: 1] | 1,179,758 rows[cite: 1] | **100% staged match**[cite: 1] |
+| **Pipeline Execution Time** | **1.9 seconds**[cite: 1] | **24.8 seconds**[cite: 1] | **~47,600 rows/sec**[cite: 1] |
+
+---
+
+### Task Breakdown & Data Cleaning Audit (`ops.cleaning_report`)
+
+Audit of transformation rules applied across 59,024 raw records[cite: 1]:
+
+| Cleaning Rule (`rule`) | Affected Rows | Technical Resolution & Impact |
+| :--- | :--- | :--- |
+| **`ts_ddmmyyyy_fixed`** | 231[cite: 1] | Parsed `DD/MM/YYYY HH:MM:SS` string format into native `TIMESTAMP`[cite: 1] |
+| **`payment_recased`** | 204[cite: 1] | Standardized text casing and stripped padding (e.g., `" COD "` $\rightarrow$ `"cod"`)[cite: 1] |
+| **`total_decimal_comma_fixed`** | 187[cite: 1] | Replaced European comma decimal separators with standard dots (`1.234,56` $\rightarrow$ `1234.56`)[cite: 1] |
+| **`ts_isot_fixed`** | 164[cite: 1] | Standardized ISO-T format (`YYYY-MM-DDTHH:MM:SS`) into native `TIMESTAMP`[cite: 1] |
+| **`customer_id_float_fixed`** | 120[cite: 1] | Cast Excel float strings (`123456.0`) to integer `BIGINT`[cite: 1] |
+| **`total_na_or_empty_to_null`** | 117[cite: 1] | Evaluated `N/A` and empty string total values to `NULL`[cite: 1] |
+| **`total_dollar_stripped`** | 112[cite: 1] | Stripped leading `$` currency symbols from numeric order totals[cite: 1] |
+| **`customer_id_missing`** | 94[cite: 1] | Isolated records missing customer identifiers[cite: 1] |
+| **`status_recased`** | 74[cite: 1] | Trimmed and lower-cased status string variants[cite: 1] |
+| **`status_junk_to_null`** | 71[cite: 1] | Replaced invalid status strings outside whitelist (e.g., `"unknown"`) with `NULL`[cite: 1] |
+| **`total_negative_kept`** | 52[cite: 1] | Preserved negative monetary values post-cleaning for downstream audit (A05)[cite: 1] |
+| **`dup_order_id_removed`** | 31[cite: 1] | Deduplicated primary key records across the ingested batch[cite: 1] |
+| **`ts_unparseable_to_null`** | 18[cite: 1] | Replaced impossible date strings (`2026-06-31`) with `NULL`[cite: 1] |
+
+---
+
+### Key Takeaways & Data Quality Pitfalls
+
+* **Manifest vs. SQL Deduplication Reconciliation Delta**:
+  Manifest reported 29 duplicate rows (`dup_rows: 29`), whereas SQL `GROUP BY order_id` deduplication removed **31 rows**[cite: 1]. The 2-row delta originates from late-arriving data[cite: 1]:
+  * Manifest evaluates duplicates strictly within same-day event time records (29 duplicates for `2026-06-02`)[cite: 1].
+  * The June 2nd file contains 883 late-arriving updates belonging to `2026-06-01`, which contained **2 internal duplicate rows**[cite: 1].
+  
+* $\text{Total Duplicates Removed (31)} = \text{Same-Day Duplicates (29)} + \text{Late-Arriving Duplicates (2)}$$[cite: 1]
+
+* **Rule as Data vs. Hardcoded SQL Logic**:
+  Initial mapping of customer countries yielded 27,322 `NULL` values due to unmapped variants[cite: 1]. Storing country mappings inside `staging.shopcore_country_map` allowed adding missing variants via `INSERT` statements[cite: 1]. This reduced `null_country` down to **548 rows** without altering query logic or redeploying code[cite: 1].
+
+* **Daily Sales Rollup Multiplicity (723 Rows vs. 400 Stores)**:
+  `core.daily_store_sales` aggregated 723 rows for 400 stores because the aggregation grain is `(store_id, order_date)`[cite: 1]. Since daily batch files contain late-arriving records across multiple dates (averaging ~1.8 dates per store per batch) plus unmapped/missing date buckets, total rollup rows exceed the physical store count[cite: 1].
+
+---
+
+### Advanced Key Takeaways & Technical Surprises
+
+* **Timezone Safety in Epoch Decoding (`SET TimeZone='UTC'`)**:
+  `signup_ts` contains mixed formats including ISO strings, `DD/MM/YYYY` dates, and Unix epoch seconds[cite: 1]. Parsing epoch values without explicitly executing `SET TimeZone='UTC'` causes DuckDB to apply local system offsets, shifting timestamp values by several hours without throwing errors[cite: 1].
+
+* **Compound Latching in Rule Auditing (`status_recased`)**:
+  Auditing `status_recased` required three joint conditions (`status IS NOT NULL`, `status <> lower(TRIM(status))`, and `clean_enum() IS NOT NULL`)[cite: 1]. Omitting the clean enum validation causes invalid uppercase values (e.g., `"UNKNOWN"`) to be miscounted as casing fixes instead of junk records, resulting in double-counting across `status_junk_to_null`[cite: 1].
+
+* **Regression Prevention via Pytest Fixtures**:
+  In-memory DuckDB connections (`duckdb.connect()`) inside `pytest` fixtures isolated test runs, verifying string cleaners against synthetic `VALUES` tables[cite: 1]. Intentionally breaking a test case (asserting `"Paid"` instead of `"paid"`) immediately flagged `1 failed, 6 passed`, verifying that pipeline regressions are caught prior to merging into main branches[cite: 1].
