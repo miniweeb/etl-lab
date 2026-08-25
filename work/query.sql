@@ -1,4 +1,8 @@
 -- ============================================================================
+-- A01: FIRST CONTACT
+-- ============================================================================
+
+-- ============================================================================
 -- TASK 7 — Mở nắp file Parquet
 -- parquet_metadata() đọc METADATA, không chạm data page.
 -- ============================================================================
@@ -51,3 +55,4 @@ SELECT
     count(*) FILTER (WHERE order_total LIKE '%,%') AS has_eu_decimal_comma,
     count(*) FILTER (WHERE order_total = 'N/A')    AS literal_na
 FROM orders_full;
+
