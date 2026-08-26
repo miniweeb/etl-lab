@@ -140,3 +140,164 @@ Audit of single batch file (`orders_2026-06-10.csv`, total 60,782 rows)[cite: 5]
   Switching the lake ingestion mode to `APPEND` forces DuckDB/Parquet writers to assign unique UUID file names per write batch[cite: 5]. This allows new Parquet files to be added alongside existing files in partition directories without overwriting prior records[cite: 5].
 * **File Fan-out in Early Partition Directories**: 
   Because daily batch files carry late updates for up to 7 prior days, earlier partition folders end up containing multiple smaller Parquet files (e.g., 8 files per folder for early dates)[cite: 5].
+
+# A03 — Data Transformation, Cleaning & Enrichment Pipeline
+
+### Data Audit & Environment Specs
+* **Target Date & Scope**: `2026-06-02` batch processing (`$root\raw\orders\orders_2026-06-02.csv`)[cite: 1]
+* **Schema Layout**: 4 isolated schemas (`core`, `marts`, `ops`, `staging`)[cite: 1]
+* **Raw Staging Volume**: 59,024 raw CSV rows ingested (Small Scale)[cite: 1]
+* **Data Quality Anomalies Identified**:
+  * **Excel Float Strings**: 120 rows with trailing `.0` (e.g., `123456.0`)[cite: 1]
+  * **Missing Identifiers**: 94 rows with `NULL` `customer_id`[cite: 1]
+  * **Corrupted Timestamps**: 18 unparseable date strings (e.g., `2026-06-31`)[cite: 1]
+  * **Late-Arriving Records**: 883 rows belonging to `2026-06-01`[cite: 1]
+* **Test Suite Verification**: 7/7 unit tests passed (`pytest` in 1.43s)[cite: 1]
+
+---
+
+### Execution Performance Metrics
+
+| Metric / Process | Small Scale (`--scale small`) | Full Scale (`--scale full`) | Performance Efficiency |
+| :--- | :--- | :--- | :--- |
+| **Raw Ingestion Volume** | 59,024 rows[cite: 1] | 1,180,490 rows[cite: 1] | **20x volume scaling** |
+| **Manifest Audit Match** | 59,024 vs 59,024 (`Match=True`)[cite: 1] | 1,180,490 vs 1,180,490 (`Match=True`)[cite: 1] | **100% reconciliation**[cite: 1] |
+| **Cleaned & Staged Rows** | 58,993 rows[cite: 1] | 1,179,758 rows[cite: 1] | **~99.93% retention**[cite: 1] |
+| **Enriched Orders Volume** | 58,993 rows[cite: 1] | 1,179,758 rows[cite: 1] | **100% staged match**[cite: 1] |
+| **Pipeline Execution Time** | **1.9 seconds**[cite: 1] | **24.8 seconds**[cite: 1] | **~47,600 rows/sec**[cite: 1] |
+
+---
+
+### Task Breakdown & Data Cleaning Audit (`ops.cleaning_report`)
+
+Audit of transformation rules applied across 59,024 raw records[cite: 1]:
+
+| Cleaning Rule (`rule`) | Affected Rows | Technical Resolution & Impact |
+| :--- | :--- | :--- |
+| **`ts_ddmmyyyy_fixed`** | 231[cite: 1] | Parsed `DD/MM/YYYY HH:MM:SS` string format into native `TIMESTAMP`[cite: 1] |
+| **`payment_recased`** | 204[cite: 1] | Standardized text casing and stripped padding (e.g., `" COD "` $\rightarrow$ `"cod"`)[cite: 1] |
+| **`total_decimal_comma_fixed`** | 187[cite: 1] | Replaced European comma decimal separators with standard dots (`1.234,56` $\rightarrow$ `1234.56`)[cite: 1] |
+| **`ts_isot_fixed`** | 164[cite: 1] | Standardized ISO-T format (`YYYY-MM-DDTHH:MM:SS`) into native `TIMESTAMP`[cite: 1] |
+| **`customer_id_float_fixed`** | 120[cite: 1] | Cast Excel float strings (`123456.0`) to integer `BIGINT`[cite: 1] |
+| **`total_na_or_empty_to_null`** | 117[cite: 1] | Evaluated `N/A` and empty string total values to `NULL`[cite: 1] |
+| **`total_dollar_stripped`** | 112[cite: 1] | Stripped leading `$` currency symbols from numeric order totals[cite: 1] |
+| **`customer_id_missing`** | 94[cite: 1] | Isolated records missing customer identifiers[cite: 1] |
+| **`status_recased`** | 74[cite: 1] | Trimmed and lower-cased status string variants[cite: 1] |
+| **`status_junk_to_null`** | 71[cite: 1] | Replaced invalid status strings outside whitelist (e.g., `"unknown"`) with `NULL`[cite: 1] |
+| **`total_negative_kept`** | 52[cite: 1] | Preserved negative monetary values post-cleaning for downstream audit (A05)[cite: 1] |
+| **`dup_order_id_removed`** | 31[cite: 1] | Deduplicated primary key records across the ingested batch[cite: 1] |
+| **`ts_unparseable_to_null`** | 18[cite: 1] | Replaced impossible date strings (`2026-06-31`) with `NULL`[cite: 1] |
+
+---
+
+### Key Takeaways & Data Quality Pitfalls
+
+* **Manifest vs. SQL Deduplication Reconciliation Delta**:
+  Manifest reported 29 duplicate rows (`dup_rows: 29`), whereas SQL `GROUP BY order_id` deduplication removed **31 rows**[cite: 1]. The 2-row delta originates from late-arriving data[cite: 1]:
+  * Manifest evaluates duplicates strictly within same-day event time records (29 duplicates for `2026-06-02`)[cite: 1].
+  * The June 2nd file contains 883 late-arriving updates belonging to `2026-06-01`, which contained **2 internal duplicate rows**[cite: 1].
+  
+* $\text{Total Duplicates Removed (31)} = \text{Same-Day Duplicates (29)} + \text{Late-Arriving Duplicates (2)}$$[cite: 1]
+
+* **Rule as Data vs. Hardcoded SQL Logic**:
+  Initial mapping of customer countries yielded 27,322 `NULL` values due to unmapped variants[cite: 1]. Storing country mappings inside `staging.shopcore_country_map` allowed adding missing variants via `INSERT` statements[cite: 1]. This reduced `null_country` down to **548 rows** without altering query logic or redeploying code[cite: 1].
+
+* **Daily Sales Rollup Multiplicity (723 Rows vs. 400 Stores)**:
+  `core.daily_store_sales` aggregated 723 rows for 400 stores because the aggregation grain is `(store_id, order_date)`[cite: 1]. Since daily batch files contain late-arriving records across multiple dates (averaging ~1.8 dates per store per batch) plus unmapped/missing date buckets, total rollup rows exceed the physical store count[cite: 1].
+
+---
+
+### Advanced Key Takeaways & Technical Surprises
+
+* **Timezone Safety in Epoch Decoding (`SET TimeZone='UTC'`)**:
+  `signup_ts` contains mixed formats including ISO strings, `DD/MM/YYYY` dates, and Unix epoch seconds[cite: 1]. Parsing epoch values without explicitly executing `SET TimeZone='UTC'` causes DuckDB to apply local system offsets, shifting timestamp values by several hours without throwing errors[cite: 1].
+
+* **Compound Latching in Rule Auditing (`status_recased`)**:
+  Auditing `status_recased` required three joint conditions (`status IS NOT NULL`, `status <> lower(TRIM(status))`, and `clean_enum() IS NOT NULL`)[cite: 1]. Omitting the clean enum validation causes invalid uppercase values (e.g., `"UNKNOWN"`) to be miscounted as casing fixes instead of junk records, resulting in double-counting across `status_junk_to_null`[cite: 1].
+
+* **Regression Prevention via Pytest Fixtures**:
+  In-memory DuckDB connections (`duckdb.connect()`) inside `pytest` fixtures isolated test runs, verifying string cleaners against synthetic `VALUES` tables[cite: 1]. Intentionally breaking a test case (asserting `"Paid"` instead of `"paid"`) immediately flagged `1 failed, 6 passed`, verifying that pipeline regressions are caught prior to merging into main branches[cite: 1].
+
+## A04 — Semi-Structured Data Processing & Data Marts
+
+### Data Specs & Ingestion Scope
+* **Target Batch & Scale**: Date `2026-06-02` processing run (`$root\raw\orders\orders_2026-06-02.csv`) across `small` and `full` scales[cite: 2].
+* **Raw Feed Volume**: 59,024 raw order rows ingested, achieving a 100% exact match against manifest audit logs[cite: 2].
+* **Semi-Structured Fields**:
+  * **`items` (VARCHAR / JSON Array)**: Array containing 1 to 6 nested JSON objects per order, detailing `sku` (VARCHAR), `qty` (INTEGER/VARCHAR), and `unit_price` (DOUBLE)[cite: 2].
+  * **`meta` (VARCHAR / JSON Object)**: Single JSON object storing session telemetry including `device` (`android`, `ios`, `web`, `desktop`), `sess` (session ID), and optional `utm` (campaign attribution)[cite: 2].
+  * **`attrs` (CSV JSON Column)**: Product attribute JSON object containing `brand`, `weight_g`, and `color`[cite: 2].
+* **Transformed Target Tables**: `core.order_items` (Item Grain) and `marts.category_daily_revenue` (Aggregated Data Mart)[cite: 2].
+
+---
+
+### Execution Performance Metrics
+
+| Benchmark / Task | Small Scale (`--scale small`) | Full Scale (`--scale full`) | Technical Efficiency & Notes |
+| :--- | :--- | :--- | :--- |
+| **Unnesting Volume (Task 3)** | 59,024 orders $\rightarrow$ 149,190 line items[cite: 2] | Scaled proportional to dataset size[cite: 2] | 100% row preservation (`item_rows` = `expected`)[cite: 2] |
+| **Data Mart Build (Task 8)** | 3 date buckets (`06-01`, `06-02`, `NULL`)[cite: 2] | 3 date buckets (`06-01`, `06-02`, `NULL`)[cite: 2] | Total Revenue: $7.55\text{M}$ (`small`) vs $149.24\text{M}$ (`full`)[cite: 2] |
+| **Streaming Query (Task 9A)** | **4.2 seconds** (9,214,235 items)[cite: 2] | **4.4 seconds** (9,214,235 items)[cite: 2] | Zero materialization overhead; 6.0s on initial cold read[cite: 2] |
+| **Materialized Table (Task 9B)** | **5.4 seconds** (9,214,235 items)[cite: 2] | **5.1 seconds** (9,214,235 items)[cite: 2] | Fully persisted temporary dataset in DuckDB memory/disk[cite: 2] |
+
+---
+
+### Task Breakdown & Data Quality Audit
+
+**1. Unnesting & Grain Transformation (`core.order_items`)**
+* **Grain Shift**: Unnesting array structures from order level down to individual line item level expanded 59,024 orders into 149,190 distinct line items[cite: 2].
+* **String-Typed Quantities (`string_typed_qty`)**: Identified 161 JSON objects where `qty` was stored as a string (e.g., `"qty": "2"`) instead of an integer[cite: 2].
+* **NULL Quantity Arrays (`lists_with_null_qty`)**: 0 rows with empty or missing quantity attributes in JSON arrays[cite: 2].
+* **Average Items per Order**: 2.53 mean line items per transaction[cite: 2].
+* **Orphan Line Items (`orphan_lines`)**: 310 line items (0.21%) referencing SKUs missing from the dimension product table[cite: 2].
+
+**2. Order & Line Item Distributions (Task 4)**
+* **Items per Order Distribution**: 1 item: 30.0% (17,691) | 2 items: 28.1% (16,596) | 3 items: 18.0% (10,631) | 4 items: 12.0% (7,074) | 5 items: 6.9% (4,074) | 6 items: 5.0% (2,958)[cite: 2].
+* **Quantity per Line Distribution**: 1 unit: 54.9% (81,949) | 2 units: 25.1% (37,397) | 3 units: 10.0% (14,896) | 4 units: 6.0% (9,009) | 5 units: 4.0% (5,939)[cite: 2].
+
+**3. Session Context & Marketing Normalization (Task 6)**
+* **Device Breakdown**: `android` (20,399) | `ios` (17,863) | `web` (14,850) | `desktop` (5,912)[cite: 2].
+* **UTM Sentinel & Missing Value Classification**:
+  * `sentinel_none`: 5,930 rows where `utm = 'none'`[cite: 2].
+  * `json_null`: 5,981 rows with native JSON `null`[cite: 2].
+  * `key_absent`: 5,945 rows missing the `utm` key entirely[cite: 2].
+  * **Total Invalid/Missing**: 17,856 rows folded into clean `NULL` values[cite: 2].
+  * **Valid Campaigns**: 41,168 rows (`google`: 17,905 | `facebook`: 11,577 | `tiktok`: 6,962 | `email`: 4,724)[cite: 2].
+
+**4. Product Attribute & Delimited Tag Extraction (Task 7)**
+* **Top Delimited Tags (`string_split(tags, '\|')`)**: `vegan` (245) | `handmade` (234) | `import` (225) | `portable` (224) | `eco` (222) | `gift` (221) | `premium` (220) | `mini` (219) | `kids` (215) | `max` (208)[cite: 2].
+* **Product Dimension Attributes (`attrs`)**: Extracted `brand`, `weight_g` (numeric via `TRY_CAST`), and `color`[cite: 2]. Top 5 brands: Stark (195), Vandelay (187), Acme (178), Aperture (171), Initech (170)[cite: 2].
+
+---
+
+### Data Mart Breakdown (`marts.category_daily_revenue`)
+
+| Date Bucket | Category Count (Small / Full) | Revenue (Small) | Revenue (Full) | Operational Insight |
+| :--- | :---: | :---: | :---: | :--- |
+| **`2026-06-01`** | 13 / 13[cite: 2] | $109,487.0[cite: 2] | $2,278,377.0[cite: 2] | ~1.5% late-arriving backdated records from previous day[cite: 2]. |
+| **`2026-06-02`** | 13 / 13[cite: 2] | $7,443,235.0[cite: 2] | $146,939,993.0[cite: 2] | Target date execution batch[cite: 2]. |
+| **`NULL`** | 12 / 13[cite: 2] | $1,958.0[cite: 2] | $28,193.0[cite: 2] | ~0.02% corrupted/unparseable timestamp records[cite: 2]. |
+
+* **Top Revenue Categories (Small)**: `office` ($734.4\text{K}$), `toys` ($704.0\text{K}$), `sports` ($689.9\text{K}$), `books` ($674.1\text{K}$), `grocery` ($670.9\text{K}$)[cite: 2].
+* **Top Revenue Categories (Full)**: `home` ($13.63\text{M}$), `electronics` ($12.80\text{M}$), `toys` ($12.77\text{M}$), `automotive` ($12.71\text{M}$), `books` ($12.26\text{M}$)[cite: 2].
+
+---
+
+### Key Takeaways & Data Quality Pitfalls
+
+* **Triple-State NULL Folding via `NULLIF`**: Web tracking data produces missing UTM values in three distinct ways: string sentinels (`"none"`), explicit JSON nulls (`null`), and completely missing keys[cite: 2]. Combining text extraction (`->>`) with `NULLIF(..., 'none')` folds all three anomalies into a single clean SQL `NULL`, preventing BI tools from misinterpreting `"none"` as an active campaign[cite: 2].
+* **String-Typed Array Anomalies**: JSON arrays in raw data occasionally mix data types (e.g., numeric `qty: 2` vs string `qty: "2"`)[cite: 2]. Explicitly typing the target struct during unnesting (`STRUCT(sku VARCHAR, qty INTEGER, unit_price DOUBLE)[]`) forces DuckDB to handle implicit conversion, mitigating runtime pipeline failures[cite: 2].
+* **Date Partition Multiplicity in Single Feeds**: Processing a single daily file (`orders_2026-06-02.csv`) outputs three date partitions[cite: 2]. Pipelines must allow aggregations to flow into appropriate historical date partitions rather than hardcoding output partitions to the file's processing date[cite: 2].
+
+---
+
+### Advanced Key Takeaways & Technical Surprises
+
+* **Strict `STRUCT` Casting vs. Flexible Extraction Failures**:
+  Executing a rigid struct cast (`CAST(meta AS STRUCT(device VARCHAR, utm VARCHAR, sess VARCHAR))`) throws a hard `Conversion Error` when keys like `utm` are missing from a row's JSON object[cite: 2]. Using flexible extractors (`meta->>'utm'`) safely resolves missing keys to `NULL` without breaking SQL query execution[cite: 2].
+
+* **Window Aggregation over Grouped Aggregates**:
+  Computing global category distributions within a single query is optimized by combining window functions over group aggregates:
+  
+  ```sql
+  round(count(*) * 100.0 / sum(count(*)) OVER (), 1) AS pct
