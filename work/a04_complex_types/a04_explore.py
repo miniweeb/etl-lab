@@ -1,7 +1,7 @@
 # %% work/a04_complex_types/a04_explore.py
 """A04 — Complex types: JSON trong ô CSV, đổi grain có chủ đích, mart đầu tiên.
 
-Chạy theo cell. Task 1-7 và 12 ở SCALE small; Task 8 cuối và Task 9 dùng full.
+Task 1-7 và 12 ở SCALE small; Task 8 cuối và Task 9 dùng full.
 """
 import os
 while not os.path.exists("lib") and os.path.dirname(os.getcwd()) != os.getcwd():
@@ -15,7 +15,7 @@ import duckdb
 
 from lib.labpaths import data_root, warehouse_path
 
-SCALE = "small"                 # Task 8 cuối bài đổi "full"
+SCALE = "full"                 # Task 8 cuối bài đổi "full"
 DAY = "2026-06-02"              # v1 day nào cũng được; số verify tính cho ngày này
 ROOT = data_root(SCALE)
 R = ROOT.as_posix()
@@ -126,14 +126,20 @@ con.sql("""
 # %% ── Task 4 — làm quen grain mới ────────────────────────────────────
 section("TASK 4 — phân bố")
 
+print("-- Phân bố số lượng mặt hàng (items) per order --")
 con.sql("""
     SELECT json_array_length(items) AS n_items, count(*) AS orders,
            round(count(*) * 100.0 / sum(count(*)) OVER (), 1) AS pct
     FROM shopcore_orders_day GROUP BY 1 ORDER BY 1
 """).show()      # 1-6 mặt hàng, ~30% ở mức 1
 
-# TODO: viết câu tương đương cho phân bố qty trên core.order_items
-#       (1-5, ~55% ở mức 1)
+print("-- Phân bố số lượng đơn vị sản phẩm (qty) per line item --")
+con.sql("""
+    SELECT qty, count(*) AS n_items,
+           round(count(*) * 100.0 / sum(count(*)) OVER (), 1) AS pct
+    FROM core.order_items
+    GROUP BY 1 ORDER BY 1
+""").show()      # 1-5, ~55% ở mức 1
 
 con.sql("""
     SELECT round(count(*) * 1.0 /
@@ -185,6 +191,17 @@ con.sql("""
     FROM shopcore_orders_day GROUP BY 1 ORDER BY 2 DESC
 """).show()      # 4 nguồn thật + NULL — gấp cả ba kiểu thành một NULL trung thực
 
+con.sql("""
+    SELECT
+      -- Gom cả 3 trường hợp (sentinel_none, json_null, key_absent) về 1 chỉ số
+      count(*) FILTER (WHERE NULLIF(CAST(meta AS JSON)->>'utm', 'none') IS NULL)     AS total_invalid_or_missing_utm,
+      
+      -- Chỉ đếm các UTM hợp lệ (facebook, email, google, ...)
+      count(*) FILTER (WHERE NULLIF(CAST(meta AS JSON)->>'utm', 'none') IS NOT NULL) AS valid_utm,
+      
+      count(*) AS total_rows
+    FROM shopcore_orders_day
+""").show()
 # %%
 section("TASK 6c — chặt HỎNG ở đây, lỏng thì không")
 
@@ -218,6 +235,25 @@ con.sql(f"""
 # %%
 section("TASK 7b — attrs là JSON object")
 
+# 1. Trích xuất thuộc tính: brand, weight_g (kiểu INT), color
+con.sql(f"""
+    SELECT 
+        attrs->>'brand' AS brand,
+        TRY_CAST(attrs->>'weight_g' AS INTEGER) AS weight_g,
+        attrs->>'color' AS color
+    FROM read_csv('{PRODUCTS}', header=true)
+""").show()
+
+# 2. Bảng đếm số lượng sản phẩm theo Thương hiệu (Brand Count Table)
+con.sql(f"""
+    SELECT 
+        attrs->>'brand' AS brand,
+        count(*) AS n_products
+    FROM read_csv('{PRODUCTS}', header=true)
+    WHERE attrs->>'brand' IS NOT NULL
+    GROUP BY 1
+    ORDER BY 2 DESC
+""").show()
 # TODO: trích brand, weight_g, color bằng công cụ Task 6.
 #       -> trả JSON, ->> trả VARCHAR: weight_g phải ra INTEGER, không phải text.
 #       Rồi trả lời: thương hiệu nào nhiều sản phẩm nhất?

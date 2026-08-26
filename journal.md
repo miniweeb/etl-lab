@@ -217,3 +217,87 @@ Audit of transformation rules applied across 59,024 raw records[cite: 1]:
 
 * **Regression Prevention via Pytest Fixtures**:
   In-memory DuckDB connections (`duckdb.connect()`) inside `pytest` fixtures isolated test runs, verifying string cleaners against synthetic `VALUES` tables[cite: 1]. Intentionally breaking a test case (asserting `"Paid"` instead of `"paid"`) immediately flagged `1 failed, 6 passed`, verifying that pipeline regressions are caught prior to merging into main branches[cite: 1].
+
+## A04 — Semi-Structured Data Processing & Data Marts
+
+### Data Specs & Ingestion Scope
+* **Target Batch & Scale**: Date `2026-06-02` processing run (`$root\raw\orders\orders_2026-06-02.csv`) across `small` and `full` scales[cite: 2].
+* **Raw Feed Volume**: 59,024 raw order rows ingested, achieving a 100% exact match against manifest audit logs[cite: 2].
+* **Semi-Structured Fields**:
+  * **`items` (VARCHAR / JSON Array)**: Array containing 1 to 6 nested JSON objects per order, detailing `sku` (VARCHAR), `qty` (INTEGER/VARCHAR), and `unit_price` (DOUBLE)[cite: 2].
+  * **`meta` (VARCHAR / JSON Object)**: Single JSON object storing session telemetry including `device` (`android`, `ios`, `web`, `desktop`), `sess` (session ID), and optional `utm` (campaign attribution)[cite: 2].
+  * **`attrs` (CSV JSON Column)**: Product attribute JSON object containing `brand`, `weight_g`, and `color`[cite: 2].
+* **Transformed Target Tables**: `core.order_items` (Item Grain) and `marts.category_daily_revenue` (Aggregated Data Mart)[cite: 2].
+
+---
+
+### Execution Performance Metrics
+
+| Benchmark / Task | Small Scale (`--scale small`) | Full Scale (`--scale full`) | Technical Efficiency & Notes |
+| :--- | :--- | :--- | :--- |
+| **Unnesting Volume (Task 3)** | 59,024 orders $\rightarrow$ 149,190 line items[cite: 2] | Scaled proportional to dataset size[cite: 2] | 100% row preservation (`item_rows` = `expected`)[cite: 2] |
+| **Data Mart Build (Task 8)** | 3 date buckets (`06-01`, `06-02`, `NULL`)[cite: 2] | 3 date buckets (`06-01`, `06-02`, `NULL`)[cite: 2] | Total Revenue: $7.55\text{M}$ (`small`) vs $149.24\text{M}$ (`full`)[cite: 2] |
+| **Streaming Query (Task 9A)** | **4.2 seconds** (9,214,235 items)[cite: 2] | **4.4 seconds** (9,214,235 items)[cite: 2] | Zero materialization overhead; 6.0s on initial cold read[cite: 2] |
+| **Materialized Table (Task 9B)** | **5.4 seconds** (9,214,235 items)[cite: 2] | **5.1 seconds** (9,214,235 items)[cite: 2] | Fully persisted temporary dataset in DuckDB memory/disk[cite: 2] |
+
+---
+
+### Task Breakdown & Data Quality Audit
+
+**1. Unnesting & Grain Transformation (`core.order_items`)**
+* **Grain Shift**: Unnesting array structures from order level down to individual line item level expanded 59,024 orders into 149,190 distinct line items[cite: 2].
+* **String-Typed Quantities (`string_typed_qty`)**: Identified 161 JSON objects where `qty` was stored as a string (e.g., `"qty": "2"`) instead of an integer[cite: 2].
+* **NULL Quantity Arrays (`lists_with_null_qty`)**: 0 rows with empty or missing quantity attributes in JSON arrays[cite: 2].
+* **Average Items per Order**: 2.53 mean line items per transaction[cite: 2].
+* **Orphan Line Items (`orphan_lines`)**: 310 line items (0.21%) referencing SKUs missing from the dimension product table[cite: 2].
+
+**2. Order & Line Item Distributions (Task 4)**
+* **Items per Order Distribution**: 1 item: 30.0% (17,691) | 2 items: 28.1% (16,596) | 3 items: 18.0% (10,631) | 4 items: 12.0% (7,074) | 5 items: 6.9% (4,074) | 6 items: 5.0% (2,958)[cite: 2].
+* **Quantity per Line Distribution**: 1 unit: 54.9% (81,949) | 2 units: 25.1% (37,397) | 3 units: 10.0% (14,896) | 4 units: 6.0% (9,009) | 5 units: 4.0% (5,939)[cite: 2].
+
+**3. Session Context & Marketing Normalization (Task 6)**
+* **Device Breakdown**: `android` (20,399) | `ios` (17,863) | `web` (14,850) | `desktop` (5,912)[cite: 2].
+* **UTM Sentinel & Missing Value Classification**:
+  * `sentinel_none`: 5,930 rows where `utm = 'none'`[cite: 2].
+  * `json_null`: 5,981 rows with native JSON `null`[cite: 2].
+  * `key_absent`: 5,945 rows missing the `utm` key entirely[cite: 2].
+  * **Total Invalid/Missing**: 17,856 rows folded into clean `NULL` values[cite: 2].
+  * **Valid Campaigns**: 41,168 rows (`google`: 17,905 | `facebook`: 11,577 | `tiktok`: 6,962 | `email`: 4,724)[cite: 2].
+
+**4. Product Attribute & Delimited Tag Extraction (Task 7)**
+* **Top Delimited Tags (`string_split(tags, '\|')`)**: `vegan` (245) | `handmade` (234) | `import` (225) | `portable` (224) | `eco` (222) | `gift` (221) | `premium` (220) | `mini` (219) | `kids` (215) | `max` (208)[cite: 2].
+* **Product Dimension Attributes (`attrs`)**: Extracted `brand`, `weight_g` (numeric via `TRY_CAST`), and `color`[cite: 2]. Top 5 brands: Stark (195), Vandelay (187), Acme (178), Aperture (171), Initech (170)[cite: 2].
+
+---
+
+### Data Mart Breakdown (`marts.category_daily_revenue`)
+
+| Date Bucket | Category Count (Small / Full) | Revenue (Small) | Revenue (Full) | Operational Insight |
+| :--- | :---: | :---: | :---: | :--- |
+| **`2026-06-01`** | 13 / 13[cite: 2] | $109,487.0[cite: 2] | $2,278,377.0[cite: 2] | ~1.5% late-arriving backdated records from previous day[cite: 2]. |
+| **`2026-06-02`** | 13 / 13[cite: 2] | $7,443,235.0[cite: 2] | $146,939,993.0[cite: 2] | Target date execution batch[cite: 2]. |
+| **`NULL`** | 12 / 13[cite: 2] | $1,958.0[cite: 2] | $28,193.0[cite: 2] | ~0.02% corrupted/unparseable timestamp records[cite: 2]. |
+
+* **Top Revenue Categories (Small)**: `office` ($734.4\text{K}$), `toys` ($704.0\text{K}$), `sports` ($689.9\text{K}$), `books` ($674.1\text{K}$), `grocery` ($670.9\text{K}$)[cite: 2].
+* **Top Revenue Categories (Full)**: `home` ($13.63\text{M}$), `electronics` ($12.80\text{M}$), `toys` ($12.77\text{M}$), `automotive` ($12.71\text{M}$), `books` ($12.26\text{M}$)[cite: 2].
+
+---
+
+### Key Takeaways & Data Quality Pitfalls
+
+* **Triple-State NULL Folding via `NULLIF`**: Web tracking data produces missing UTM values in three distinct ways: string sentinels (`"none"`), explicit JSON nulls (`null`), and completely missing keys[cite: 2]. Combining text extraction (`->>`) with `NULLIF(..., 'none')` folds all three anomalies into a single clean SQL `NULL`, preventing BI tools from misinterpreting `"none"` as an active campaign[cite: 2].
+* **String-Typed Array Anomalies**: JSON arrays in raw data occasionally mix data types (e.g., numeric `qty: 2` vs string `qty: "2"`)[cite: 2]. Explicitly typing the target struct during unnesting (`STRUCT(sku VARCHAR, qty INTEGER, unit_price DOUBLE)[]`) forces DuckDB to handle implicit conversion, mitigating runtime pipeline failures[cite: 2].
+* **Date Partition Multiplicity in Single Feeds**: Processing a single daily file (`orders_2026-06-02.csv`) outputs three date partitions[cite: 2]. Pipelines must allow aggregations to flow into appropriate historical date partitions rather than hardcoding output partitions to the file's processing date[cite: 2].
+
+---
+
+### Advanced Key Takeaways & Technical Surprises
+
+* **Strict `STRUCT` Casting vs. Flexible Extraction Failures**:
+  Executing a rigid struct cast (`CAST(meta AS STRUCT(device VARCHAR, utm VARCHAR, sess VARCHAR))`) throws a hard `Conversion Error` when keys like `utm` are missing from a row's JSON object[cite: 2]. Using flexible extractors (`meta->>'utm'`) safely resolves missing keys to `NULL` without breaking SQL query execution[cite: 2].
+
+* **Window Aggregation over Grouped Aggregates**:
+  Computing global category distributions within a single query is optimized by combining window functions over group aggregates:
+  
+  ```sql
+  round(count(*) * 100.0 / sum(count(*)) OVER (), 1) AS pct
