@@ -349,3 +349,297 @@ COPY (
 
 DESCRIBE SELECT * FROM read_parquet('D:/etl_lab/small/tmp/items_nested.parquet');
 -- cột items quay về đúng kiểu STRUCT(...)[] đầy đủ
+
+-- ============================================================================
+-- A05: VALIDATION & QUARANTINE
+-- ============================================================================
+-- Đường dẫn giả định SCALE = small. Đổi 'D:/etl_lab/small' -> 'D:/etl_lab'
+-- khi chạy full. Ngày mẫu: 2026-06-02.
+--
+-- LUẬT LỚN NHẤT CỦA BÀI: đếm -> cách ly -> gate -> nạp.
+-- Gate đặt sau INSERT là chuông báo cháy lắp sau khi cháy xong.
+
+
+-- ============================================================================
+-- TASK 2 — MANIFEST: LỜI KHAI CỦA PRODUCER
+-- read_json_auto đọc JSON như một bảng.
+-- ============================================================================
+
+SELECT rows, late_rows, dup_rows
+FROM read_json_auto('D:/etl_lab/small/manifests/orders_2026-06-02.json');
+-- rows = 59024. late_rows = dòng mang order_ts của ngày TRƯỚC (bản sửa trễ).
+-- dup_rows = order_id lặp trong CÙNG file (bản sửa trong ngày). Không phải rác.
+
+
+-- ============================================================================
+-- TASK 3 — STAGING ĐÃ LÀM SẠCH
+-- Chỉ chuẩn hoá CÁCH BIỂU DIỄN. Không map 'unknown' -> NULL, không drop dòng.
+-- Hai cột enum cố ý KHÔNG dùng clean_enum: status rác phải tới quarantine với
+-- giá trị còn nguyên làm bằng chứng.
+-- ============================================================================
+
+CREATE OR REPLACE TABLE staging.shopcore_orders_day AS
+SELECT
+    order_id,
+    CAST(TRY_CAST(customer_id AS DOUBLE) AS BIGINT)            AS customer_id,
+    store_id,
+    try_strptime(order_ts, ['%Y-%m-%d %H:%M:%S',
+                            '%d/%m/%Y %H:%M:%S',
+                            '%Y-%m-%dT%H:%M:%S'])              AS order_ts,
+    updated_at,
+    NULLIF(LOWER(TRIM(status)), '')                            AS status,
+    NULLIF(LOWER(TRIM(payment_method)), '')                    AS payment_method,
+    TRY_CAST(NULLIF(
+      CASE WHEN order_total LIKE '%,%'
+           THEN replace(replace(order_total, '.', ''), ',', '.')
+           ELSE replace(TRIM(order_total), '$', '') END,
+      'N/A') AS DECIMAL(14,2))                                 AS order_total,
+    items,
+    meta,
+    DATE '2026-06-02'                                          AS _data_date,
+    CAST(NULL AS BIGINT)                                       AS _run_id
+FROM read_csv('D:/etl_lab/small/raw/orders/orders_2026-06-02.csv',
+    header = true,
+    columns = {'order_id':'BIGINT','customer_id':'VARCHAR','store_id':'INTEGER',
+               'order_ts':'VARCHAR','updated_at':'TIMESTAMP','status':'VARCHAR',
+               'payment_method':'VARCHAR','order_total':'VARCHAR',
+               'items':'VARCHAR','meta':'VARCHAR'});
+
+-- RECONCILIATION không chính thức: phải bằng ĐÚNG manifest rows.
+SELECT count(*) FROM staging.shopcore_orders_day;   -- 59024
+
+
+-- ============================================================================
+-- TASK 4 — ITEMS_AGG: items nói đơn hàng đáng bao nhiêu
+-- GROUP BY (order_id, updated_at) chứ KHÔNG phải order_id: ~0,05% id lặp.
+-- unnest KHÔNG ngồi chung SELECT với GROUP BY -> bung ở truy vấn con.
+-- ============================================================================
+
+CREATE OR REPLACE TEMP TABLE items_agg AS
+SELECT order_id, updated_at,
+       round(sum(it.qty * it.unit_price), 2) AS items_total,
+       count(*) FILTER (p.sku IS NULL)       AS n_orphan_sku
+FROM (
+    SELECT order_id, updated_at,
+           unnest(CAST(items AS JSON)::STRUCT(sku VARCHAR, qty INTEGER,
+                                              unit_price DOUBLE)[]) AS it
+    FROM staging.shopcore_orders_day
+) LEFT JOIN read_csv('D:/etl_lab/small/raw/dims/products.csv', header = true) p
+       ON it.sku = p.sku
+GROUP BY 1, 2;
+
+SELECT count(*) FROM items_agg;                          -- = staged
+SELECT count(*) FROM items_agg WHERE n_orphan_sku > 0;   -- ~310
+
+
+-- ============================================================================
+-- TASK 5 — BỘ CHECK -> MỘT reject_reason MỖI DÒNG
+-- concat_ws BỎ QUA NULL; NULLIF(...,'') để dòng sạch có reject_reason NULL.
+-- Một dòng có thể hỏng nhiều luật cùng lúc -> danh sách ngăn bằng '; '.
+-- ============================================================================
+
+CREATE OR REPLACE TEMP TABLE flagged AS
+SELECT s.*, i.items_total,
+       NULLIF(concat_ws('; ',
+         CASE WHEN s.order_id IS NULL THEN 'null_order_id' END,
+         CASE WHEN s.order_ts IS NULL THEN 'bad_order_ts' END,
+         CASE WHEN s.order_ts IS NOT NULL AND NOT (
+                s.order_ts >= GREATEST(DATE '2026-06-01',
+                                       DATE '2026-06-02' - INTERVAL 7 DAY)
+            AND s.order_ts <  DATE '2026-06-02' + INTERVAL 1 DAY)
+              THEN 'ts_out_of_range' END,
+         CASE WHEN s.status IS NULL OR s.status NOT IN
+              ('created','paid','shipped','delivered','cancelled','refunded')
+              THEN 'bad_status' END,
+         -- TODO(you) 'bad_payment': card/wallet/bank_transfer/cod/paypal
+         CASE WHEN s.order_total IS NULL THEN 'null_total' END,
+         CASE WHEN s.order_total < 0 THEN 'negative_total' END,
+         CASE WHEN s.order_total >= 0 AND i.items_total IS NOT NULL
+               AND abs(s.order_total - i.items_total) > 0.01
+              THEN 'total_mismatch' END,
+         -- TODO(you) 'null_customer' / 'orphan_customer' / 'orphan_store'
+         CASE WHEN i.n_orphan_sku > 0 THEN 'orphan_sku' END
+       ), '') AS reject_reason
+FROM staging.shopcore_orders_day s
+LEFT JOIN items_agg i USING (order_id, updated_at)
+LEFT JOIN read_csv('D:/etl_lab/small/raw/dims/customers.csv', header = true) c
+       ON s.customer_id = c.customer_id
+LEFT JOIN read_csv('D:/etl_lab/small/raw/dims/stores.csv', header = true) st
+       ON s.store_id = st.store_id;
+
+-- count(reject_reason) đếm non-NULL = số dòng vào quarantine. Đích: 992 (1,68%).
+SELECT count(*) AS staged, count(reject_reason) AS bad FROM flagged;
+
+-- Nhìn mười nạn nhân. Mỗi lý do phải khiến bạn gật đầu.
+SELECT order_id, status, payment_method, order_total, items_total, reject_reason
+FROM flagged WHERE reject_reason IS NOT NULL LIMIT 10;
+
+-- Phân rã theo từng lý do (bung danh sách '; ' ra thành dòng)
+SELECT reason, count(*) AS n
+FROM (SELECT unnest(string_split(reject_reason, '; ')) AS reason
+      FROM flagged WHERE reject_reason IS NOT NULL)
+GROUP BY 1 ORDER BY 2 DESC;
+
+
+-- ============================================================================
+-- TASK 6 — SPLIT LOAD
+-- ============================================================================
+
+-- ----------------------------------------------------------------------------
+-- 6.1 — BẰNG CHỨNG luôn được ghi, kể cả (nhất là) vào ngày tồi tệ
+-- Nhớ mkdir thư mục CHA trước: COPY tạo folder partition, không tạo folder cha.
+-- ----------------------------------------------------------------------------
+COPY (
+  SELECT *, now() AT TIME ZONE 'UTC' AS _rejected_at,
+         COALESCE(CAST(order_ts AS DATE), DATE '2026-06-02') AS order_date
+  FROM flagged WHERE reject_reason IS NOT NULL
+) TO 'D:/etl_lab/small/quarantine/orders'
+  (FORMAT parquet, PARTITION_BY (order_date), OVERWRITE_OR_IGNORE,
+   FILENAME_PATTERN 'from_2026-06-02_{i}');
+-- COALESCE: dòng timestamp hỏng mượn ngày của file thay vì thành khoá NULL.
+-- FILENAME_PATTERN: dòng xấu đến trễ rơi vào phân vùng CŨ HƠN -> nhiều ngày cùng
+--   ghi một folder; tên mặc định data_0.parquet sẽ để D+1 ĐÈ lên D.
+
+-- ----------------------------------------------------------------------------
+-- 6.2 — GATE (phần so ngưỡng làm bằng Python; đây là truy vấn nó dựa vào)
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ops.alerts (
+  alert_ts TIMESTAMP, run_id BIGINT, severity VARCHAR,
+  source VARCHAR, message VARCHAR);
+
+SELECT reason, round(100.0 * count(*) / 59024, 3) AS pct
+FROM (SELECT unnest(string_split(reject_reason, '; ')) AS reason
+      FROM flagged WHERE reject_reason IS NOT NULL)
+GROUP BY 1;
+
+-- ----------------------------------------------------------------------------
+-- 6.3 — DÒNG TỐT
+-- grain: một dòng = MỘT PHIÊN BẢN được giao của một đơn (order_id, _data_date).
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS core.orders AS
+SELECT * EXCLUDE (reject_reason), CAST(order_ts AS DATE) AS order_date
+FROM flagged WHERE 1 = 0;          -- WHERE 1=0: sao chép HÌNH DẠNG, 0 dòng
+
+INSERT INTO core.orders
+SELECT * EXCLUDE (reject_reason), CAST(order_ts AS DATE) AS order_date
+FROM flagged WHERE reject_reason IS NULL;
+-- INSERT trần KHÔNG idempotent. Chạy lại = DROP TABLE core.orders rồi nạp lại.
+-- A07 sửa tử tế.
+
+SELECT count(*) FROM core.orders;   -- 58032 = 59024 - 992
+
+
+-- ============================================================================
+-- TASK 7 — ops.dq_report: DẤU VẾT GIẤY TỜ
+-- Ghi CẢ check 0 lỗi. bad_payment = 0 CHỨNG MINH chuẩn hoá A03 đang chạy đúng.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS ops.dq_report (
+  run_at TIMESTAMP, order_date DATE, check_type VARCHAR, check_name VARCHAR,
+  rows_checked BIGINT, rows_failed BIGINT, pct_failed DOUBLE,
+  threshold_pct DOUBLE, passed BOOLEAN);
+
+-- ROW: quan sát được LEFT JOIN lên DANH SÁCH ĐẦY ĐỦ 12 check.
+-- Threshold hard-code ở đây CHỈ để đọc; trong work/ nó phải chảy từ YAML.
+INSERT INTO ops.dq_report
+WITH observed AS (
+  SELECT reason, count(*) AS n
+  FROM (SELECT unnest(string_split(reject_reason, '; ')) AS reason
+        FROM flagged WHERE reject_reason IS NOT NULL)
+  GROUP BY 1
+)
+SELECT current_timestamp, DATE '2026-06-02', 'row', c.check_name,
+       59024, coalesce(o.n, 0),
+       round(100.0 * coalesce(o.n, 0) / 59024, 3) AS pct,
+       c.threshold_pct,
+       coalesce(pct <= c.threshold_pct, true)
+FROM (VALUES ('null_order_id', NULL), ('bad_order_ts', 0.5),
+             ('ts_out_of_range', NULL), ('bad_status', 1.0),
+             ('bad_payment', NULL), ('null_total', 1.0),
+             ('negative_total', NULL), ('total_mismatch', 1.0),
+             ('null_customer', NULL), ('orphan_customer', 0.5),
+             ('orphan_store', NULL), ('orphan_sku', 1.0)
+     ) c(check_name, threshold_pct)
+LEFT JOIN observed o ON o.reason = c.check_name;
+
+-- AGGREGATE: cặp (order_id, updated_at) phải DUY NHẤT — lời khẳng định Task 4
+INSERT INTO ops.dq_report
+SELECT current_timestamp, DATE '2026-06-02', 'aggregate',
+       'unique_order_id_updated_at',
+       59024, count(*), round(100.0 * count(*) / 59024, 3), 0.0, count(*) = 0
+FROM (SELECT order_id, updated_at FROM staging.shopcore_orders_day
+      GROUP BY 1, 2 HAVING count(*) > 1);
+
+-- TODO(you) AGGREGATE 'dup_order_id' — cùng khuôn, GROUP BY riêng order_id.
+--   Informational (threshold NULL, passed true). Bản sửa trong ngày là bình
+--   thường: BÁO CÁO tỉ lệ, KHÔNG loại dòng nào. A08 gấp chúng lại.
+
+-- RECONCILIATION: check rẻ nhất, giá trị cao nhất trong cả bộ suite
+INSERT INTO ops.dq_report
+SELECT current_timestamp, DATE '2026-06-02', 'reconciliation',
+       'rowcount_vs_manifest',
+       59024, abs(59024 - rows), NULL, 0.0, 59024 = rows
+FROM read_json_auto('D:/etl_lab/small/manifests/orders_2026-06-02.json');
+
+-- TODO(you) AGGREGATE 'quarantine_rate' — tỉ lệ chung cả ngày.
+--   threshold_pct NULL (contract cấp ngân sách theo RULE, không theo ngày).
+--   Đây là dòng mà biểu đồ xu hướng Stretch 1 dựng lên.
+
+
+-- ============================================================================
+-- VERIFY YOURSELF
+-- ============================================================================
+
+SELECT count(*) FROM core.orders;
+-- 414095   (58032 + 179044 + 177019)
+
+SELECT check_name, rows_failed, pct_failed FROM ops.dq_report
+WHERE order_date = DATE '2026-06-02' AND check_type = 'row'
+ORDER BY rows_failed DESC;
+-- orphan_sku 310 · total_mismatch 308 · null_total 117 · null_customer 94
+-- bad_status 71 · negative_total 52 · orphan_customer 27 · bad_order_ts 18
+-- ts_out_of_range, bad_payment, orphan_store, null_order_id: đều 0
+
+SELECT count(*) FROM ops.dq_report;
+-- 48 (16 x 3 ngày; run hỏng của Task 10 sẽ thêm 16 nữa)
+
+-- Tổng theo check của 06-02 (997) LỚN HƠN số dòng quarantine (992):
+-- năm dòng hỏng hai luật cùng lúc. Chứng minh:
+SELECT count(*) FROM read_parquet('D:/etl_lab/small/quarantine/orders/**/*.parquet')
+WHERE _data_date = DATE '2026-06-02' AND reject_reason LIKE '%;%';
+-- 5
+-- Chú ý: chọn theo _data_date, KHÔNG theo folder order_date — dòng xấu đến trễ
+-- không nằm cùng phân vùng với file nó đến cùng.
+
+-- Dấu vết pager sau demo Task 9 + Task 10:
+SELECT severity, source, message FROM ops.alerts ORDER BY alert_ts;
+-- error · freshness · FRESHNESS BREACH: ... max(_data_date) = 2026-07-11, expected 2026-07-12
+-- error · dq_gate   · DQ HARD FAIL 2026-06-19: total_mismatch at 0.522% exceeds ... 0.1%
+
+
+-- ============================================================================
+-- STRETCH GOALS
+-- ============================================================================
+
+-- 1. Đường xu hướng: chạy cả 45 ngày v1 ở small (~2 phút) rồi nhìn theo ngày.
+--    Phải PHẲNG ở ~1,7%, kể cả ngày cao điểm. Đây là dashboard DQ hữu ích nhất
+--    trong đội thật.
+SELECT order_date, pct_failed FROM ops.dq_report
+WHERE check_name = 'quarantine_rate' ORDER BY order_date;
+
+-- 2. Dải sản lượng: contract nói load ngoài 0,5x–4x trung vị 7 ngày gần nhất thì
+--    phải cảnh báo. Dựng như một aggregate check trên lịch sử rows_checked.
+--    (Chạy stretch 1 trước để có lịch sử.) Ghi alert severity 'warn'.
+SELECT order_date, rows_checked,
+       median(rows_checked) OVER (ORDER BY order_date
+                                  ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING) AS med7
+FROM ops.dq_report WHERE check_name = 'rowcount_vs_manifest'
+ORDER BY order_date;
+-- Ngày cao điểm phải NẰM TRONG dải — độ rộng đó là cố ý.
+
+-- 3. Replay: đọc dòng đã cách ly, chạy lại bộ check HIỆN TẠI, đếm xem bao nhiêu
+--    dòng nay sẽ pass. Đó là cách phục hồi dữ liệu sau khi nới một luật quá chặt,
+--    và là mùi vị đầu tiên của tư duy backfill ở A11.
+SELECT reject_reason, count(*) AS n
+FROM read_parquet('D:/etl_lab/small/quarantine/orders/**/*.parquet')
+GROUP BY 1 ORDER BY 2 DESC LIMIT 20;
