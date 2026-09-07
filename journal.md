@@ -192,3 +192,297 @@
 - Split load bảo vệ Core: Tách dòng lỗi đẩy sang quarantine Parquet theo cơ chế append, không bao giờ để dòng hỏng lọt vào `core`.
 - Tỷ lệ vi phạm đồng nhất: Tỷ lệ bản ghi bị quarantine giữ ổn định ở mức ~1.66% - 1.72% xuyên suốt từ Small đến Full và qua các đợt flash-sale.
 - Module hóa: Hàm `validate_day` gói gọn logic nạp, kiểm định và split load, sẵn sàng tích hợp trực tiếp vào pipeline và runner tự động.
+
+## A06 — Data contracts
+
+### Task 1 — Per-column contract interrogation (10 câu hỏi nghiệp vụ)
+
+1. **order_total tiền tệ gì, ai làm tròn, làm tròn thế nào?**
+   - USD, đơn tệ theo hợp đồng; scale 2, làm tròn half-up do **Producer** thực hiện trước khi export. Warehouse lưu trữ nguyên trạng, **tuyệt đối không làm tròn lại**.
+   - *Điều khoản:* `schema.order_total.money`.
+
+2. **Một khoản hoàn tiền (refund) về mang dấu gì?**
+   - Số tiền mang **dấu dương**. Bản chất âm thể hiện qua trạng thái `status: refunded`. Phép tính doanh thu `SUM(order_total)` ngây thơ sẽ thổi phồng số liệu nếu bỏ qua status.
+   - *Điều khoản:* `schema.order_total.money.negative_allowed` & `business_rules.refunds`.
+
+3. **order_ts timezone gì, ai đã chuyển đổi, ai xử lý DST?**
+   - Timezone **UTC** (chuỗi `'YYYY-MM-DD HH:MM:SS'`, không offset). **Producer** chuyển đổi từ giờ địa phương cửa hàng sang UTC và tự xử lý bù/trừ giờ mùa hè (DST) trước khi xuất file.
+   - *Điều khoản:* `schema.order_ts.timezone`.
+
+4. **Finance muốn báo cáo theo giờ địa phương của store. Việc chuyển đổi diễn ra ở đâu — và vì sao contract CẤM chuyển đổi lúc ingest?**
+   - Diễn ra ở tầng **Marts / Reporting downstream** bằng cách join bảng dimension `stores`.
+   - Cấm lúc ingest vì một fact thô UTC phục vụ được **mọi** mart vùng miền; nếu convert ngay lúc ingest thì fact đó chỉ phục vụ được duy nhất một mục đích cục bộ.
+   - *Điều khoản:* `schema.order_ts.warehouse_policy`.
+
+5. **customer_id về NULL: mất dữ liệu, bug của producer, hay mang ý nghĩa?**
+   - Mang **ý nghĩa nghiệp vụ**: Khách vãng lai mua hàng không đăng nhập tài khoản (Guest checkout). Không phải mất dữ liệu hay lỗi.
+   - *Điều khoản:* `schema.customer_id.nullable` & `schema.customer_id.comment`.
+
+6. **order_id có duy nhất không? Duy nhất trong phạm vi nào?**
+   - Duy nhất trên **từng đơn hàng ngoài đời thực**. **Không duy nhất trong một file hoặc trong một ngày** do cơ chế bản sửa cập nhật trạng thái (in-file corrections / re-sends).
+   - *Điều khoản:* `schema.order_id.unique`.
+
+7. **Hai cột nào quyết định bản sao nào của một đơn gửi lại sẽ THẮNG?**
+   - Cặp `(order_id, updated_at)`. Bản ghi có giá trị `updated_at` lớn hơn sẽ thắng (cơ chế latest-wins by value).
+   - *Điều khoản:* `late_corrections.semantics` & `quality.duplicates.latest_wins_key`.
+
+8. **File ngày D được với ngược về quá khứ bao xa? Nạp file D có thể chạm vào những phân vùng lake nào?**
+   - Về quá khứ tối đa **7 ngày**. Quá trình nạp file D có thể tác động tới các partition lake từ `order_date = D - 7 ngày` đến `D`.
+   - *Điều khoản:* `late_corrections.window_days` & `delivery.business_date`.
+
+9. **Làm sao biết một lần giao hàng là HOÀN TẤT — hai con số nào phải đối chiếu ở MỌI lần nạp?**
+   - Nhận biết qua file manifest JSON đi kèm (`raw/manifest/orders_YYYY-MM-DD.json`).
+   - Hai con số đối chiếu bắt buộc: `loaded_rows == manifest.rows` và `bytes on disk == manifest.bytes`.
+   - *Điều khoản:* `delivery.completeness_signal` & `quality.reconciliation`.
+
+10. **Vào lúc mấy giờ thì một file thiếu không còn là buổi sáng chậm chạp của bạn mà trở thành SỰ CỐ của shopcore?**
+    - Đúng **04:00 UTC**. (File dự kiến xong lúc 02:00 UTC, trễ quá 04:00 UTC vi phạm cam kết SLA và chính thức thành incident của Producer).
+    - *Điều khoản:* `delivery.freshness_sla`.
+
+### Task 2 — Violation vs Gap vs Tolerated Classification
+
+#### Numbers (Quarantine tổng hợp 3 ngày: ~421,293 dòng đã stage)
+- Tổng dòng kiểm dịch (Quarantine): 7,198 dòng (~1.71%).
+- Phân rã theo từng mã lỗi (một dòng có thể dính nhiều lỗi đồng thời):
+
+| Reject reason | Rows | Tỷ lệ | Ngưỡng Contract | Phân loại | Bản chất & Hướng xử lý |
+|---|---|---|---|---|---|
+| `negative_total` | 423 | 0.10% | 0.0% (Không có) | **VIOLATION** | Vi phạm `money.negative_allowed: false`. Không có tolerance -> Báo cáo Producer sửa từ gốc. |
+| `total_mismatch` | 2,190 | 0.52% | 1.0% | **VIOLATION** | Vi phạm cross-field rule. Dưới ngưỡng chịu đựng -> Ghi bằng chứng, nạp phần sạch, báo cáo định kỳ. |
+| `orphan_sku` | 2,172 | 0.52% | 1.0% | **VIOLATION** | Vi phạm tham chiếu SKU sang product dim. Dưới ngưỡng chịu đựng. |
+| `null_total` | 901 | 0.21% | 1.0% | **VIOLATION** | Vi phạm `order_total.nullable: false`. Dưới ngưỡng chịu đựng. |
+| `bad_status` | 616 | 0.15% | 1.0% | **VIOLATION** | Vi phạm whitelist enum và lowercase. Dưới ngưỡng chịu đựng. |
+| `orphan_customer` | 214 | 0.05% | 0.5% | **VIOLATION** | Vi phạm tham chiếu khách hàng có đăng ký tài khoản. Dưới ngưỡng chịu đựng. |
+| `bad_order_ts` | 88 | 0.02% | 0.5% | **VIOLATION** | Vi phạm format thời gian (hoàn toàn unparseable). Dưới ngưỡng chịu đựng. |
+| `null_customer` | 632 | 0.15% | — | **BUG PHÍA CONSUMER** | `customer_id` có `nullable: true` (Guest checkout). Pipeline A05 cách ly nhầm dữ liệu hợp lệ -> Khắc phục ở A07. |
+| `dup_order_id` | ~210 | ~0.05% | 0.2% | **TOLERATED** | Đơn hàng lặp nội bộ file. Hợp đồng cho phép tường minh như cái giá của cơ chế at-least-once delivery. |
+
+#### New knowledge & Core insights (Task 2)
+- **Ranh giới khái niệm giữa Tolerated và Violation within tolerance**:
+  - *Tolerated*: Là thứ hợp đồng **cho phép xảy ra** như một đặc tính kỹ thuật bình thường (chỉ có duy nhất `within_file_exact_resends` <= 0.2%). Không phải là lỗi.
+  - *Violation within tolerance*: Là hành vi **phá vỡ cam kết** (tiền âm, sai enum, lệch tổng). Các mức 0.5% hay 1.0% trong `row_level_tolerances` chỉ là *ngưỡng chịu đựng (hard-fail threshold)* để pipeline không bị sập vì rác thông thường. Chúng vẫn là vi phạm và bắt buộc phải đếm để gửi sang Producer hàng tuần theo điều khoản `slo_reporting`.
+- **Trách nhiệm quy kết (Accountability)**:
+  - `negative_total` là vi phạm không có ngân sách khoan nhượng (zero-tolerance). 423 dòng này là lỗi thuần túy của Shopcore cần mở incident.
+  - `null_customer` chứng minh rằng không phải mọi dòng rơi vào quarantine đều là lỗi của Producer; viết check sai so với hợp đồng sẽ biến Consumer thành bên gây gián đoạn dữ liệu hợp lệ.
+
+---
+
+### Task 3 — Săn khoảng trống hợp đồng (The Gap Hunt)
+
+*Khoảng trống (Gap) là những thứ contract IM LẶNG — không cấm, không cho phép. Không thể đổ lỗi cho Producer về một cam kết họ chưa từng đưa ra. Nếu Consumer không xử lý tường minh, Gap sẽ âm thầm phá hủy pipeline. Bảng dưới đây là hạt giống để soạn thảo Amendment v1.4.0 ở Task 11 & Task 12.*
+
+| Sự im lặng (Contract KHÔNG nói gì) | Nó cắn thế nào (Rủi ro & Hậu quả cụ thể) | Điều khoản sẽ khép nó lại (Seed for v1.4.0) |
+|---|---|---|
+| **1. Múi giờ & Ngữ nghĩa của `updated_at`** *(Seeded `# NOTE`)* | Không ghi rõ timezone (UTC hay local?), không rõ là thời điểm xảy ra sự kiện (event time) hay lúc quét xuất file batch. Cột này dùng làm khóa dedupe (`latest-wins`), nếu producer đổi server lệch múi giờ thì bản ghi cũ sẽ đè bản ghi mới. CSV sniffer còn tự đoán thành `TIMESTAMP WITH TIME ZONE`. | `schema.updated_at.timezone: UTC` và quy định rõ `semantics: event_time` (mốc thời gian ghi nhận thay đổi tại OLTP DB). |
+| **2. Kiểu dữ liệu nội hàm & Độ dài mảng `items`** *(Seeded `# NOTE`)* | Từ khóa `"number"` không ghim rõ là integer hay float, không cấm dạng chuỗi `"qty": "2"`. Không giới hạn số phần tử mảng (nguy cơ mảng khổng lồ gây tràn RAM khi `UNNEST`), không có quy ước giá trị rỗng cho trường tùy chọn. | Bổ sung `schema.items.shape` chi tiết: ghim rõ `qty: integer`, `unit_price: decimal(14,2)`, giới hạn `max_items: 50`. |
+| **3. Transport Locale của tiền tệ (`order_total`)** | Contract ghim `currency: USD` nhưng im lặng về ký tự phân cách (transport locale). Producer gửi dấu phẩy châu Âu (`93,32` hoặc `1.234,56`). Nếu ép kiểu trực tiếp sẽ lỗi cú pháp; nếu xóa nhầm dấu phẩy sẽ khiến giá trị sai lệch 100 lần. | `schema.order_total.money.transport_locale`: quy định rõ `decimal_separator: "."`, `thousands_separator: none`, `currency_symbols: none`. |
+| **4. Chính sách bảo vệ dữ liệu định danh cá nhân (PII) & Retention** | Feed `customers` mang cột `email` — thông tin định danh cá nhân (PII). Hợp đồng không cho phép cũng không cấm, khiến `core.customers` vô tình trở thành kho lưu email thô suốt từ A03, đối mặt rủi ro vi phạm bảo mật dữ liệu. | Bổ sung khối cấp cao `data_classification.pii`: cấm lưu email thô trong warehouse, bắt buộc băm một chiều `email_hash: md5(lower(trim(email)))` ngay tại ingest. |
+| **5. Cơ chế công bố lại dữ liệu quá khứ (Restatement Policy)** | `delivery.freshness_sla` tự thừa nhận v1.3.0 chưa có điều khoản restatement. Nếu Producer âm thầm tạo lại và xuất đè file của 3 ngày trước thì Consumer không nhận được cảnh báo, gây lệch số liệu lịch sử trên các dashboard đã chốt. | Bổ sung điều khoản `delivery.restatement_policy`: yêu cầu thông báo trước qua `#shopcore-data-changes` kèm cờ nhận diện khi xuất lại file cũ hơn 2 ngày. |
+| **6. Cách biểu diễn giá trị rỗng của metadata (`meta.utm`)** | `utm` được khai báo là tùy chọn (`string?`) nhưng không quy định hình thức rỗng. Dữ liệu thực tế lúc thì thiếu key, lúc mang `null`, lúc mang chuỗi `"none"`, buộc Consumer phải viết logic xử lý chắp vá ở A04. | `schema.meta.null_representation: absent_key_or_null` (chuẩn hóa cách biểu diễn giá trị rỗng của các trường JSON tùy chọn). |
+
+#### Core insights (Task 3)
+- **Sự nguy hiểm của khoảng trống**: Một vi phạm (Violation) thì rõ ràng và có thể phạt bằng cách từ chối/báo cáo. Một khoảng trống (Gap) thì không ai chịu trách nhiệm. Khi dữ liệu gây lỗi pipeline, Consumer không thể bắt đền Producer vì họ chưa từng hứa.
+- **Con đường đóng khoảng trống**: Xử lý tường minh trong pipeline của mình (như hàm clean regex tiền tệ ở A03), đồng thời chuyển hóa nó thành đề xuất sửa đổi hợp đồng (Proposed Amendment) để chính thức hóa trách nhiệm giữa hai bên.
+
+### Task 4 — Bốn check tự viết cho gate
+
+| Check | Điều kiện dòng xấu | Tolerance |
+|---|---|---|
+| `customer_id_not_castable` | `IS NOT NULL AND TRY_CAST(... AS BIGINT) IS NULL` | 0 |
+| `store_id_not_castable` | `IS NULL OR TRY_CAST(... AS INTEGER) IS NULL` | 0 |
+| `unparseable_order_total` | `IS NULL OR NOT regexp_matches(..., '^[0-9]+\.[0-9]{2}$')` | 1% |
+| Tầng 5 — cửa sổ sửa trễ | `min_date < file_date - 7` hoặc `max_date > file_date` | — |
+
+**Bẫy `customer_id`**: cột này `nullable: true`, NULL nghĩa là khách vãng lai chứ
+không phải rác. Nên phải viết `IS NOT NULL AND`, ngược hẳn với `order_id`. Cùng
+cái bẫy đã gặp ở check orphan_customer của A05.
+
+**Regex tiền**: một dòng gói được cả bốn ràng buộc — USD thuần, hai số lẻ, không
+âm, không ký hiệu.
+
+**Vì sao đọc mọi thứ dưới dạng text (`all_varchar=true`)**: nếu để DuckDB tự đoán
+kiểu thì kiểu sẽ trôi theo rác. Nó gọi `customer_id` là DOUBLE chỉ vì 0.2% rác
+Excel-float của A03. Gate phải tự cast bằng `TRY_CAST` và đối chiếu với block
+`schema` trong contract, đó mới là điểm cố định.
+
+**Vì sao `ts_recover` thử cứu trước khi kết luận**: "không parse được" hẹp hơn
+"sai định dạng". Có ~0.7% dòng viết sai dạng nhưng vẫn cứu được (DD/MM, ISO-T);
+chỉ ~0.02% là không cứu nổi. Tolerance 0.5% dành cho nhóm sau. Nếu hard-fail theo
+nhóm trước thì gate đỏ mỗi ngày, mà gate luôn đỏ thì không ai đọc.
+
+**`payment_method` chỉ cảnh báo, không chặn**: enum có ghim nhưng
+`row_level_tolerances` không có ngưỡng nào cho nó. Không có ngưỡng đã thoả thuận
+thì mình chỉ được đo và báo, chưa được chặn. Đây là nguyên liệu cho amendment T11.
+
+**`SAMPLE_ROWS = 100_000`**: đây là mình chọn, không phải contract quy định. Nó là
+lý do sweep full scale vẫn nhanh.
+
+### Task 5 — Validate chính contract bằng pydantic
+
+Gate rất nghiêm với dữ liệu, nhưng với contract thì cả tin. `yaml.safe_load` trả
+về dict trần, nên mọi `contract["schema"]` sau đó chỉ là đoán mò về một file do
+người sửa tay. Mà contract này sắp bị sửa hai lần ở T11–T12.
+
+Hai kiểu hỏng:
+- **Gõ sai khoá** (`nullible:`) — YAML nhận bình thường vì đó vẫn là khoá hợp lệ.
+  Chỗ nào mình viết `.get()` thì không báo lỗi gì cả, một luật cứ thế ngừng chạy.
+  Gate có luật tắt âm thầm còn tệ hơn không có gate, vì mình vẫn tin nó.
+- **Sai kiểu** (`window_days: seven`) — im tới lúc tính late-corrections, ở file
+  thứ 30 của 45, báo TypeError về `timedelta` và không nhắc gì tới contract.
+
+Bốn quyết định trong `contract_model.py`:
+- `extra="forbid"` — pydantic mặc định bỏ qua khoá lạ. Gõ sai khoá tuỳ chọn
+  (`alowed_values:`) sẽ bị nuốt im lặng y hệt yaml.
+- Chỉ mô hình hoá phần gate đọc; phần còn lại khai `dict[str, Any]`. Nhưng vẫn
+  phải khai, không thì `extra="forbid"` vô nghĩa.
+- `columns` + `alias="schema"` vì `BaseModel.schema` bị pydantic chiếm rồi.
+- Ghim cả kiểu chứ không riêng khoá. Chuỗi `"false"` là truthy trong Python, nên
+  `if money["negative_allowed"]:` sẽ đọc thành "cho phép âm" — luật tiền lật ngược.
+
+Chạy ra: yaml nạp file hỏng không kêu tiếng nào, báo `nullable = <<GONE>>`. Pydantic
+bắt 3 lỗi. Chỗ đáng đọc là **đường dẫn lỗi**: `schema.1.nullible` nói rõ cột thứ
+hai, khoá nullible, không được phép. Đó là địa chỉ mình đưa lại được cho người
+soạn amendment. Một lỗi chính tả sinh ra hai lỗi cùng lúc.
+
+Khi nào đừng dùng: pydantic dành cho config thôi. Dựng model cho từng dòng dữ liệu
+là 82 triệu object Python với feed full — hàng giờ CPU để trả lời câu DuckDB làm
+xong trong một lượt quét.
+
+### Task 6 — Sweep 45 ngày (small)
+
+`python -m work.a06_data_contract.a06_contract_check --scale small --start 2026-06-01 --end 2026-07-15`
+
+45/45 PASS, 9 giây. Mỗi file kèm một `[warn] payment_method` — đúng thiết kế.
+Chi phí mỗi file là lần đọc mẫu, không phải kích thước file. T9 sẽ kiểm điều đó.
+
+### Task 7 — Phá gate có chủ ý
+
+| File hỏng | Tầng bắt được | Thông điệp |
+|---|---|---|
+| `dropped_col` (xoá `payment_method`) | 3 — schema | missing column + trích MAJOR/30 ngày |
+| `added_col` (thêm `currency`) | 3 — schema | unexpected column + trích MINOR/7 ngày |
+| `type_change` (`order_id` → `'ORD-...'`) | 4 — giá trị | `order_id_not_castable` 5000/5000 (100%) |
+
+Kết quả: 0/3 PASS.
+
+**Điểm quan trọng nhất**: `type_change` **lọt qua** tầng schema vì tên cột và thứ
+tự cột không đổi gì cả. Chỉ tầng giá trị mới bắt được, ở tỉ lệ cast hỏng 100%.
+Nhìn output là thấy: chỉ file này mới có dòng `[warn] payment_method`, vì hai file
+kia đã bị chặn ở tầng 3 nên gate không bao giờ đọc tới giá trị.
+
+**Thông điệp nêu ví dụ cụ thể** (`'ORD-1520029791'`) là thứ biến nó thành hành
+động được — producer nhìn phát biết ngay chuyện gì xảy ra, không cần đọc code
+của mình.
+
+**Cả ba đều có `[warn]` manifest**: bản copy scratch không có tín hiệu hoàn tất.
+Gate nói ra chỗ nó không kiểm được thay vì im lặng bỏ qua.
+
+Ba kiểu hỏng này không ngẫu nhiên: cột `currency` mới và `order_id` dạng chuỗi
+chính là thứ shopcore sẽ ship dưới tên "month 2" ở A10.
+
+
+### Task 9 — Sweep full scale
+
+`python -m work.a06_data_contract.a06_contract_check --scale full --start 2026-06-01 --end 2026-07-15`
+
+45/45 PASS, **13 giây** (so với 9 giây ở small).
+
+File full ~350 MB mỗi cái, to gấp 20 lần small, nhưng gate chỉ chậm 1.4×. Vì nó
+đọc 100k dòng rồi dừng — chi phí mỗi file là một lần đọc mẫu, không phải kích
+thước file. Memory gần như không nhúc nhích.
+
+Đây là yêu cầu thiết kế: pre-flight check phải rẻ đủ để không ai bị cám dỗ bỏ
+qua. Bỏ `LIMIT` thì sweep full đọc ~16 GB thay vì vài trăm MB, và gate đắt là
+gate bị bỏ qua.
+
+**Bug đường dẫn**: lần chạy đầu ra 0/45 vì `main()` ghép `DATA_ROOT / "full" /
+raw/orders`, nhưng full scale nằm thẳng ở `D:\etl_lab\raw\orders`, chỉ small mới
+có thư mục con. Sửa bằng cách dùng `data_root(scale)` từ `lib.labpaths`.
+Đáng chú ý: gate vẫn làm đúng việc — file không tồn tại là FAIL, đó chính là
+`freshness_sla`. Chỉ là nguyên nhân nằm ở phía mình.
+
+**payment_method ổn định ~0.30%** ở mọi ngày, cả small lẫn full, kể cả ngày
+flash-sale. Rác có cấu trúc, không phải nhiễu ngẫu nhiên. Con số này là bằng
+chứng cho amendment ở T11.
+
+### Task 10 — Catalogue thay đổi hợp đồng & SemVer Mapping
+
+Căn cứ quy định tại `change_management.policy`: Mọi thay đổi phá vỡ cam kết (Breaking) yêu cầu thông báo trước 30 ngày kèm MAJOR bump. Mọi thay đổi mang tính tương thích ngược (Additive) yêu cầu thông báo trước 7 ngày kèm MINOR bump, và consumer phải chịu được cột lạ.
+
+| # | Kịch bản thay đổi từ Producer | Breaking hay không? Với ai? | Bump & Thời hạn báo trước |
+|---|---|---|---|
+| **1** | Thêm cột `currency` vào cuối file | **Non-breaking** với reader đọc theo tên cột. **Breaking** với reader đọc theo vị trí, hoặc gate đối chiếu danh sách cột chính xác. | **MINOR**, 7 ngày (`notice_additive`) |
+| **2** | `order_id` BIGINT $\rightarrow$ `'ORD-...'` | **Breaking toàn diện**: phá schema lưu trữ, hỏng join, 100% rớt quarantine. | **MAJOR**, 30 ngày (`notice_breaking`) |
+| **3** | Đổi tên `order_total` $\rightarrow$ `total_amount` | **Breaking toàn diện** với downstream: mọi SQL, mart, script gọi tên cũ sập ngay. | **MAJOR**, 30 ngày (`notice_breaking`) |
+| **4** | Thêm `crypto` vào enum `payment_method` | **Breaking với consumer**, không với producer. Producer thấy chỉ thêm text; consumer có whitelist cứng đẩy hết bản ghi mới vào quarantine. | **MAJOR (đề xuất)** — 30 ngày |
+| **5** | `order_ts` UTC $\rightarrow$ giờ store-local | **Breaking âm thầm**. Tên cột, thứ tự, kiểu đều không đổi nên gate mù hoàn toàn. Hỏng tận số liệu: doanh thu theo ngày lệch, mart theo vùng sai hết. | **MAJOR** (phá `order_ts.timezone`), 30 ngày |
+| **6** | `null_or_invalid_status` bò 0.15% $\rightarrow$ 0.9% | **Không phải schema change**. Gate vẫn PASS vì dưới 1%. Nhưng chất lượng đang suy thoái, chỉ thấy được nếu lưu lịch sử gate. | **Không bump**. Cảnh báo xu hướng qua SLO hằng tuần |
+
+#### Ba điểm rút ra:
+1. **Gate của mình nghiêm hơn contract**: Kịch bản 1 — contract ghi rõ *consumer must tolerate unknown columns*, nhưng gate lại fail khi gặp cột thừa. Đây là quyết định thiết kế chủ quan của consumer, không phải điều khoản hai bên ký. Hai hướng xử lý: nới lỏng gate cho đúng cam kết, hoặc đàm phán bắt buộc producer khai báo cột mới trước hạn — nội dung đưa vào amendment Task 11.
+2. **Contract im lặng về việc mở rộng enum**: `change_management` chỉ định nghĩa MAJOR cho rename/removal/type change, hoàn toàn bỏ quên việc thêm giá trị vào `allowed_values`. Do đó câu trả lời MAJOR ở kịch bản 4 thuần túy là đề xuất đơn phương từ phía consumer, chưa có cơ sở pháp lý. Đây là một gap lớn cần khép lại ở Task 11.
+3. **Ba tầng nghiêm trọng với độ phơi nhiễm khác nhau**:
+   - Kịch bản 2–3: Gate bắt được ngay lập tức tại tầng schema/kiểu dữ liệu.
+   - Kịch bản 5: Gate mù hoàn toàn vì schema không đổi — cần bổ sung semantic check (như so sánh phân bố giờ trong ngày với baseline lịch sử).
+   - Kịch bản 6: Gate vẫn xanh nhưng rác đang bò sát trần dung sai — cần quan sát theo chuỗi thời gian. Đây là lý do kiến trúc cần bảng `ops.contract_checks`: nếu không lưu lịch sử, hệ thống chỉ thấy được lát cắt của ngày hôm nay.
+
+### Task 11 — Soạn amendment v1.4.0
+
+Sản phẩm: `work/amendment_v1_4_0.md`, hai clause + rollout note.
+Contract đã ký giữ nguyên từng byte.
+
+| Clause | Đặt ở | Khép gap nào |
+|---|---|---|
+| transport_locale | `schema.order_total.money` | Dấu phẩy châu Âu và tiền tố `$` từ gap thành violation |
+| updated_at semantics | `schema.updated_at` | Cột dedupe mà không ai biết nó đo gì |
+
+**Vì sao MINOR**: hai clause chỉ viết ra thành lời cái ý định vốn đã có —
+`money` đã ghim USD và scale 2, `latest_wins_key` đã dựa vào `updated_at`.
+Không code consumer nào vỡ, không cột nào bị xoá/đổi tên/đổi kiểu. Nhưng nhiều
+hơn PATCH: PATCH sửa câu chữ, đây là thêm ràng buộc gate cưỡng chế được.
+Báo trước 7 ngày qua `#shopcore-data-changes`. Trạng thái `proposed` cho tới khi
+shopcore ký đối ứng — trước đó consumer không được dựa vào.
+
+**Paste-check**: cả hai đoạn qua `yaml.safe_load` sạch. Clause sai cú pháp là
+clause không review được.
+
+Một chi tiết bắt được lúc paste-check: `nullable: false` ra bool thật, còn
+`thousands_separator: none` ra **chuỗi** `'none'`. Đúng cái bẫy T5 — chuỗi khác
+rỗng là truthy, `if locale["thousands_separator"]:` sẽ đọc thành "có dấu phân
+cách nghìn".
+
+### Task 12 — PII: clause phải triển khai được
+
+Gap này khác mọi gap còn lại. Các gap kia gây số sai; gap này gây nghĩa vụ thông
+báo rò rỉ dữ liệu. Và `core.customers` đã lưu email thô từ A03 — không ai quyết
+định điều đó, không clause nào cho phép cũng không clause nào cấm.
+
+Clause hứa hai thứ, nên phải đo trước khi phá cột:
+
+| | Trước | Sau |
+|---|---|---|
+| dup rows theo email | 180 | — |
+| dup rows theo email_hash | — | **180** |
+
+- Nửa 1 — phơi nhiễm biến mất: `DESCRIBE` cho thấy `email_hash VARCHAR` ở vị trí
+  thứ ba, không còn `email` ở đâu.
+- Nửa 2 — khả năng được giữ: 180 y hệt. Và tín hiệu vẫn dùng được, mỗi
+  `email_hash` trùng vẫn ra đúng hai `customer_id`: `[256, 30256]`,
+  `[7984, 37984]`, `[16265, 46265]`.
+
+**Vì sao `md5(lower(trim(email)))` chứ không `md5(email)`**: biểu thức này giờ
+là một clause, nó không được phép dựa vào chuyện A03 mãi mãi làm sạch ở thượng
+nguồn. `md5('John@X.com') != md5('john@x.com')` — hash chưa chuẩn hoá sẽ âm thầm
+đánh mất đúng cái khả năng mà clause hứa. Chuẩn hoá tại chỗ hash, luôn luôn.
+
+**Chạy lần hai thì hỏng**: `Binder Error: Referenced column "email" not found`,
+kèm gợi ý `Candidate bindings: "email_hash"`. Lỗi đó chính là clause đang hoạt
+động — không còn email thô để hash lại, cũng không còn để rò rỉ.
+
+**Ba cách che PII**: hash để phân tích (một chiều, quan hệ bằng nhau vẫn còn),
+mask để hiển thị (giữ hình dạng, không so bằng được), tokenize khi cần lấy lại
+giá trị gốc (chỉ vault mới đảo ngược).
+
+**Clause này còn có tương lai**: ở A15, `stg_shopcore__customers` sẽ tính chính
+`email_hash` đó thẳng từ feed thô và không bao giờ select cột thô — clause được
+cưỡng chế bằng cách xây dựng, mỗi lần dbt rebuild.
