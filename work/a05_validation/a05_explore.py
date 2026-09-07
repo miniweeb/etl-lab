@@ -733,3 +733,4 @@ section("TASK 12 — cùng bộ luật, viết dưới dạng KHAI BÁO")
 # gặp một validation FRAMEWORK: giờ bạn biết chính xác nó đang làm hộ bạn cái gì.
 # Luật §7.5: công cụ KHÔNG thay thế bản tự dựng, nó đứng CẠNH. Pipeline vẫn gate
 # bằng SQL — vì check phải chạy Ở NƠI 82 triệu dòng đang nằm.
+# %%

@@ -643,3 +643,131 @@ ORDER BY order_date;
 SELECT reject_reason, count(*) AS n
 FROM read_parquet('D:/etl_lab/small/quarantine/orders/**/*.parquet')
 GROUP BY 1 ORDER BY 2 DESC LIMIT 20;
+
+-- ============================================================================
+-- A06: DATA CONTRACTS
+-- ============================================================================
+-- Phần lớn A06 là Python và công việc VIẾT. SQL chỉ xuất hiện ở hai chỗ:
+-- phân loại phát hiện A05 (Task 2) và cuộc di trú PII (Task 12).
+--
+-- Đường dẫn giả định SCALE = small. Đổi 'D:/etl_lab/small' -> 'D:/etl_lab'
+-- khi chạy full.
+
+
+-- ============================================================================
+-- TASK 2 — VI PHẠM HAY KHOẢNG TRỐNG?
+-- ============================================================================
+-- violation  = contract MINH THỊ CẤM   -> cách ly, đếm, BÁO CÁO producer
+-- gap        = contract IM LẶNG        -> xử lý trong ETL + đề xuất sửa đổi
+-- tolerated  = contract cho phép ở mức tỉ lệ đó
+
+-- Tổng hợp quarantine theo lý do gộp
+SELECT reject_reason, count(*) AS rows
+FROM read_parquet('D:/etl_lab/small/quarantine/orders/order_date=*/*.parquet')
+GROUP BY 1 ORDER BY 2 DESC;
+
+-- Bung danh sách '; ' để phân loại TỪNG lý do riêng lẻ
+SELECT reason, count(*) AS rows
+FROM (SELECT unnest(string_split(reject_reason, '; ')) AS reason
+      FROM read_parquet('D:/etl_lab/small/quarantine/orders/order_date=*/*.parquet'))
+GROUP BY 1 ORDER BY 2 DESC;
+
+-- Đối chiếu với dq_report — nhớ CẢ các check bằng 0 (chúng cũng là bằng chứng)
+SELECT check_name, sum(rows_failed) AS rows_failed
+FROM ops.dq_report WHERE check_type = 'row'
+GROUP BY 1 ORDER BY 2 DESC;
+
+-- Bảng phân loại phải khớp với đề:
+--   negative order_total            violation  money.negative_allowed: false
+--   'N/A'/rỗng order_total          violation  DECIMAL đã hứa, nullable: false
+--   status rác / sai hoa thường     violation  allowed_values + "lowercase, no padding"
+--   payment_method sai hoa thường   violation  allowed_values + case
+--                                              (báo hằng tuần; KHÔNG có tolerance
+--                                               hard-fail — bạn có để ý không?)
+--   DD/MM + ISO-T order_ts          violation  dạng viết ghim trong schema.order_ts
+--   Excel-float customer_id         violation  BIGINT đã hứa
+--   total != items sum quá ±0.01    violation  schema.order_total.business_rule
+--   orphan customer_id / SKU        violation  references + tolerances
+--   gửi lại y hệt trong file (≤0.2%) TOLERATED giao hàng at-least-once
+--   dấu phẩy châu Âu / tiền tố $    GAP        money im lặng về transport locale
+--   "qty":"2" dạng chuỗi trong items GAP       items "number" chưa ghim (# NOTE)
+--   utm null vs "none" vs vắng khoá  GAP       cách biểu diễn null chưa nêu
+
+
+-- ============================================================================
+-- TASK 12 — PII: ĐIỀU KHOẢN KHÔNG THỂ NẰM TRÊN GIẤY
+-- ============================================================================
+-- core.customers đã lưu email THÔ từ A03. Không ai quyết định điều đó — không
+-- điều khoản nào cho phép, không điều khoản nào cấm. Warehouse trở thành kho PII
+-- DO TAI NẠN.
+
+-- ----------------------------------------------------------------------------
+-- TRƯỚC: cột thô mang bao nhiêu tín hiệu email trùng?
+-- (Truy vấn này tái tạo TRỰC TIẾP ~0,3% rác chung-email bạn gặp ở A03.)
+-- Phải ĐO TRƯỚC khi phá huỷ cột — nếu không, không chứng minh được là đã GIỮ.
+-- ----------------------------------------------------------------------------
+SELECT count(email) - count(DISTINCT email) AS dup_email_rows
+FROM core.customers;                            -- small: 180
+
+-- ----------------------------------------------------------------------------
+-- DỰNG LẠI: cùng một bảng — nhưng giá trị thô KHÔNG SỐNG SÓT qua nó
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE TABLE core.customers AS
+SELECT customer_id, name,
+       md5(lower(trim(email))) AS email_hash,   -- chuẩn hoá BÊN TRONG phép hash
+       country, city, signup_ts, is_active,
+       _data_date, _run_id                      -- hai cột lineage §7.2
+FROM core.customers;
+-- VÌ SAO KHÔNG PHẢI md5(email)? Biểu thức này giờ LÀ MỘT ĐIỀU KHOẢN — nó không
+-- được phụ thuộc vào việc A03 mãi mãi làm sạch ở thượng nguồn. Và
+-- md5('John@X.com') != md5('john@x.com'): hash chưa chuẩn hoá ÂM THẦM đánh mất
+-- chính năng lực dedupe mà điều khoản hứa hẹn.
+
+-- ----------------------------------------------------------------------------
+-- SAU, nửa lời hứa 1 — PHƠI NHIỄM BIẾN MẤT
+-- ----------------------------------------------------------------------------
+DESCRIBE core.customers;      -- email_hash VARCHAR ở vị trí 3, không có `email`
+
+-- ----------------------------------------------------------------------------
+-- SAU, nửa lời hứa 2 — NĂNG LỰC ĐƯỢC GIỮ
+-- ----------------------------------------------------------------------------
+SELECT count(email_hash) - count(DISTINCT email_hash) AS dup_hash_rows
+FROM core.customers;                            -- small: 180 — Y HỆT
+
+-- Và tín hiệu vẫn DÙNG ĐƯỢC: các cặp chung email A03 tìm ra, vẫn tìm ra
+SELECT email_hash, list(customer_id) AS shares_email
+FROM core.customers
+GROUP BY email_hash HAVING count(*) > 1
+LIMIT 3;          -- 3 trong 180 cặp, đúng hai customer_id mỗi list
+
+-- Chạy lại phép dựng lần thứ hai -> Binder Error: Referenced column "email" not
+-- found. Lỗi đó CHÍNH LÀ điều khoản đang hoạt động: không còn email thô nào để
+-- hash lại, hoặc để rò rỉ.
+
+
+-- ============================================================================
+-- VERIFY YOURSELF (small, sau khi dựng lại)
+-- ============================================================================
+SELECT count(*) FROM core.customers;                                  -- 60000
+SELECT count(email_hash) - count(DISTINCT email_hash)
+FROM core.customers;                                                  -- 180
+SELECT count(*) FROM (SELECT 1 FROM core.customers
+                      GROUP BY email_hash HAVING count(*) > 1);       -- 180
+-- Warehouse full: ba truy vấn trên trả 1.200.000 / 3.594 / 3.594 — tỉ lệ trùng
+-- email ~0,3% của A03, SỐNG SÓT qua việc gỡ bỏ chính cột đã mang nó.
+
+
+-- ============================================================================
+-- STRETCH GOAL 1 — LỊCH SỬ CONTRACT-CHECK
+-- ============================================================================
+-- Ghi MỌI kết quả gate vào ops.contract_checks. Một tỉ lệ bò dần về phía
+-- tolerance qua nhiều tuần chính là kịch bản #6 của Task 10 được PHƠI RA.
+CREATE TABLE IF NOT EXISTS ops.contract_checks (
+  run_at TIMESTAMP, order_date DATE, file_name VARCHAR, check_name VARCHAR,
+  rate DOUBLE, tolerance DOUBLE, passed BOOLEAN);
+
+-- Đường xu hướng sau khi đã có lịch sử:
+SELECT order_date, check_name, rate, tolerance
+FROM ops.contract_checks
+WHERE check_name = 'null_or_invalid_status'
+ORDER BY order_date;
