@@ -286,10 +286,40 @@ def load_good(con: duckdb.DuckDBPyConnection) -> None:
     """)
 
 
+# # ── Task 8 ───────────────────────────────────────────────────────────────
+# def validate_day(con: duckdb.DuckDBPyConnection, day: str, scale: str = "small",
+#                  thresholds: dict[str, float] | None = None) -> None:
+#     """Một ngày, đầu đến cuối. Thứ tự các lời gọi CHÍNH LÀ bài học của A05."""
+#     thresholds = load_thresholds() if thresholds is None else thresholds
+#     staged = stage_day(con, day, scale)
+#     flag_rows(con, day, scale)
+#     bad = con.execute("SELECT count(reject_reason) FROM flagged").fetchone()[0]
+#     pct = 100.0 * bad / staged
+#     report(con, day, scale, staged, bad, pct, thresholds)   # trước gate: dòng
+#     quarantine_bad(con, day, scale)                         # report phải sống sót
+#     check_gate(con, day, staged, thresholds)                # kể cả khi run chết
+#     load_good(con)
+#     print(f"{day}: staged={staged} core+={staged - bad} "
+#           f"quarantined={bad} ({pct:.2f}%)")
+
 # ── Task 8 ───────────────────────────────────────────────────────────────
 def validate_day(con: duckdb.DuckDBPyConnection, day: str, scale: str = "small",
-                 thresholds: dict[str, float] | None = None) -> None:
+                 thresholds: dict[str, float] | None = None,
+                 csv_path: Path | None = None) -> None:
     """Một ngày, đầu đến cuối. Thứ tự các lời gọi CHÍNH LÀ bài học của A05."""
+    from pathlib import Path
+    from work.a06_data_contract.a06_contract_check import load_contract, check_file
+
+    if csv_path is None:
+        csv_path = raw_orders_dir(scale) / f"orders_{day}.csv"
+
+    problems = check_file(csv_path, load_contract())
+    if problems:
+        for msg in problems:
+            print(" -", msg)
+        raise SystemExit(f"[contract gate] {csv_path.name} FAILED - nothing was loaded.")
+    print(f"[contract gate] {csv_path.name} PASS")
+
     thresholds = load_thresholds() if thresholds is None else thresholds
     staged = stage_day(con, day, scale)
     flag_rows(con, day, scale)
