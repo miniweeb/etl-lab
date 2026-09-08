@@ -486,3 +486,333 @@ giá trị gốc (chỉ vault mới đảo ngược).
 **Clause này còn có tương lai**: ở A15, `stg_shopcore__customers` sẽ tính chính
 `email_hash` đó thẳng từ feed thô và không bao giờ select cột thô — clause được
 cưỡng chế bằng cách xây dựng, mỗi lần dbt rebuild.
+
+## A07 — Lỗi, retry và tính idempotent
+
+### Numbers
+
+| | Small (2026-06-03) | Full (2026-06-01) |
+|---|---|---|
+| Rows | 62,707 | 1,214,064 |
+| Checksum | 15477265932102261913 | 9351036678762254023 |
+| File CSV | 18.1 MB | 352.3 MB |
+| Thời gian một lần load | ~1.5s | ~3s |
+
+- Full scale ba ngày: 1,214,064 + 1,180,490 + 1,254,150 = **3,648,704 dòng, 13 giây**,
+  từ ~1 GB CSV. RAM giữ ở mức 1–2 GB nhờ streaming — so với ngoại suy 34 GB của
+  pandas ở A01.
+- Ledger small: **7 success / 34 failed** trên 41 run_id. Không dòng nào kẹt `running`.
+- Ledger full: **5 success / 3 failed** trên 8 run_id.
+- Đối soát manifest ba ngày full: khớp chính xác 100%.
+
+---
+
+### Task 0 — core.orders đúng hình dạng
+
+`core.orders` trước khi drop: **472,127 dòng** — di sản của A05 (INSERT trần, nhân
+đôi) cộng một lần load thừa cuối A06. Dựng lại còn 13 cột: 10 cột nguồn +
+`order_date` + `_data_date` + `_run_id`.
+
+Đó là dữ liệu dẫn xuất — dựng lại được từ `raw/`, và sau hôm nay mình sở hữu chính
+công cụ dựng lại nó an toàn. Tâm thế **raw + code = sự thật**.
+
+Warehouse full cũng phải làm y vậy, nhưng mãi tới Task 9 mới phát hiện: bảng cũ ở
+đó có **14 cột**, nên INSERT nổ `Binder Error: table orders has 14 columns but 13
+values were supplied`. Đáng chú ý — đó là `BinderException`, không phải
+`TransientError`, nên `with_retry` **không** thử lại. Đúng thiết kế: schema sai thì
+chạy lại một triệu lần vẫn sai.
+
+---
+
+### Task 1 — Bug chạy hai lần
+
+62,707 → **125,414** sau lần INSERT thứ hai. Không exception, không cảnh báo.
+
+**Vì sao INSERT trần không bao giờ an toàn khi chạy lại**: nó chỉ biết THÊM, không
+biết trạng thái đích hiện có gì — nên kết quả phụ thuộc số lần chạy chứ không phụ
+thuộc dữ liệu nguồn. Một job retry sau timeout, một lần chạy tay để "chắc ăn", đều
+nhân đôi dữ liệu mà không để lại dấu vết.
+
+Vài `order_id` ra **4 lần**: chúng vốn đã trùng trong file (in-file dup của A03),
+giờ nhân đôi thêm. Hai vấn đề khác nhau — A08 xử lý loại thứ nhất, A07 xử lý loại
+thứ hai.
+
+---
+
+### Task 2 — Run ledger `ops.etl_runs`
+
+Chín cột: `run_id · run_date · step · status · started_at · finished_at · rows ·
+source_file · error`.
+
+**Mỗi LẦN THỬ một dòng riêng**, không phải mỗi ngày một dòng. Nếu mỗi ngày một dòng
+thì lần chạy thứ hai ghi đè lần thứ nhất và mất sạch lịch sử thất bại. Task 6 crash
+34 lần — ledger nhớ hết. Thất bại là lịch sử đáng giữ, không phải điều đáng che.
+
+**Hai cột `source_file` và `finished_at` sống ở đây, không sống trên dòng dữ liệu.**
+Đó chính là `_source_file` và `_loaded_at` mà A03 từ chối. Chúng là thuộc tính của
+LẦN CHẠY, không phải của từng đơn hàng — đơn hàng không "có" một tên file, cái lần
+chạy nạp nó mới có.
+
+Đo được: đóng lên mỗi dòng thì 62,707 bản sao giống hệt của cùng một chuỗi (1.2
+triệu ở full). Lưu ở ledger thì một dòng, và mọi dòng trỏ tới bằng `_run_id` 8 byte.
+Nạp lại ngày đó từ file đã sửa → **một** dòng ledger đổi, thay vì ghi lại cùng chuỗi
+1.2 triệu lần. Đây là normalization thông thường, cùng quy tắc giữ địa chỉ khách
+hàng không bị chép vào từng dòng đơn hàng.
+
+---
+
+### Task 3 — stage → validate → publish nguyên tử
+
+Ba chi tiết trong bộ khung:
+
+1. `UPDATE ... status='success'` nằm **bên trong** `BEGIN…COMMIT` — ledger không bao
+   giờ khai thành công cho dữ liệu không tồn tại.
+2. `DELETE WHERE _data_date = ?` chạy cả ở lần load **đầu tiên** (xoá 0 dòng, không
+   tốn gì). Lần đầu và lần chạy lại đi **cùng một nhánh code** — ít nhánh, ít bug.
+3. `INSERT` mở dòng ledger ghi `source_file` **ngay**, trước khi có gì hỏng. Một lần
+   thử thất bại vẫn phải nói được nó nghẹn ở file nào.
+
+**Hai chỗ tự viết:**
+- `already_succeeded()` — `SELECT count(*) > 0 FROM ops.etl_runs WHERE run_date = ?
+  AND step = 'load_day' AND status = 'success'`. Chỉ tính `success`: một ngày có
+  mười dòng `failed` vẫn là chưa load, và phải load lại được mà không cần `--force`.
+- `CREATE SCHEMA` đặt sai chỗ trong `ensure_tables()` — nó nằm **sau** `CREATE TABLE
+  ops.etl_runs`. Trên warehouse đã có schema `ops` từ A05 thì vẫn chạy, nên bug này
+  chỉ nổ trên máy sạch. Đó là lý do nó nguy hiểm.
+
+Chạy hai lần, cả hai `published 62707 rows`, checksum giống hệt.
+
+**Checksum cố ý chỉ hash cột nghiệp vụ** (`order_id, updated_at, status,
+order_total`). `_run_id` **phải** khác giữa hai lần chạy — đó là lineage ghi lịch
+sử, không phải dữ liệu thay đổi. Giá trị `hash()` chỉ so được trong cùng một bản cài
+DuckDB.
+
+---
+
+### Task 4 — Preflight: bảy check trước khi chạm dữ liệu
+
+Thứ làm hỏng pipeline lúc 2 giờ sáng hiếm khi là SQL:
+
+| # | Check | Điểm đáng chú ý |
+|---|---|---|
+| 1 | data root writable | Thư mục có thể tồn tại mà vẫn từ chối ghi — phải THỬ GHI, không phải `.exists()` |
+| 2 | free space on data volume | Chỗ trống ổ C không giúp gì nếu dữ liệu ở ổ D |
+| 3 | temp dir on data volume | Spill sang ổ hệ thống làm đầy ổ C và treo máy |
+| 4 | source CSV + manifest | *(tự viết)* ba cách delivery hỏng |
+| 5 | warehouse writable, not locked | **Mở connection chính là phép dò khoá** |
+| 6 | schemas creatable | `CREATE SCHEMA IF NOT EXISTS` = dò quyền miễn phí |
+| 7 | contract parseable | YAML hỏng fail ở đây, không phải giữa pipeline |
+
+**Check 4 tự viết** — ba nhánh, gộp thành đúng một dòng kết quả:
+- CSV không tồn tại → gõ nhầm `--date`, hoặc chưa chạy generator
+- CSV tồn tại nhưng 0 byte → **sự cố thượng nguồn**, báo shopcore
+- manifest JSON không tồn tại → thiếu completeness signal
+
+Khi FAIL, `detail` nêu **đích danh đường dẫn** (`D:\etl_lab\small\raw\orders\
+orders_2026-05-01.csv not found`), không viết "file bị thiếu". Người trực cần địa
+chỉ, không cần lời than.
+
+**Diễn tập đỏ/xanh — mã thoát là phần quan trọng nhất:**
+
+| Lệnh | Kết quả | Exit |
+|---|---|---|
+| bình thường | 7 PASS | 0 |
+| `--tmp C:\Windows\Temp` | check 3 FAIL | 1 |
+| `--date 2026-05-01` | check 4 FAIL, nêu đúng path | 1 |
+
+Mã thoát là thứ scheduler tuân theo; báo cáo đỏ mà vẫn exit 0 là chuông báo cháy
+không lắp pin.
+
+**Preflight không dừng sớm** như contract gate của A06 — sáu check kia vẫn chạy khi
+một check đỏ, vì lúc 2 giờ sáng cần thấy toàn bộ tình trạng trong một lượt chứ không
+phải sửa từng cái rồi chạy lại bảy lần.
+
+**Check 6 báo `skipped: no connection` khi check 5 fail** — không in PASS giả cho
+một check chưa chạy.
+
+Check 5 kích hoạt thật nhiều lần trong buổi: kernel Jupyter giữ `warehouse.duckdb`.
+Nhịp làm việc cho cả A07: `con.close()` → chạy script ở terminal → `connect` lại.
+Ngoài ra còn 4 process python treo từ 10 ngày trước, dọn bằng
+`Get-Process python | Stop-Process -Force`.
+
+---
+
+### Task 5 — Git rescue kit
+
+**Ba lệnh:**
+
+| Khi nào | Lệnh |
+|---|---|
+| Sửa hỏng, chưa commit | `git restore <file>` |
+| Cần file từ một commit cũ | `git checkout <sha> -- <file>` |
+| Quay cả repo về một commit | `git reset --hard <sha>` |
+
+Hai lệnh đầu chỉ đụng file nêu tên. Lệnh thứ ba đụng tất cả — nó xoá luôn
+`a07_explore.py` khỏi đĩa.
+
+**Bốn điều rút ra:**
+
+1. **Git chỉ cứu được thứ đã giao cho nó.** `git status` in `M` là file đang theo
+   dõi (cứu được), `??` là git không biết (xoá là mất). `a07_explore.py` mang `??`
+   suốt buổi — phá nó thay vì phá loader là mất 387 dòng.
+2. **Định lượng thiệt hại trước khi hoảng.** `git diff --stat` cho `313 deletions`.
+   Có con số thì mới chọn được cách xử lý.
+3. **`reset --hard` không xoá hẳn.** Commit `a43176b` biến khỏi `git log` nhưng còn
+   trong `git reflog`, và explore được lấy lại từ chính commit "đã chết" đó. Git giữ
+   khoảng 30 ngày.
+4. **Làm trước Task 6–7** vì hai task đó bắt sửa code liên tục trong lúc pipeline
+   crash. Savepoint `07673bd`.
+
+**Liên hệ với chủ đề bài:** loader idempotent = chạy lại thì dữ liệu về đúng một
+trạng thái. Git savepoint = `reset --hard` thì code về đúng một trạng thái. Cùng
+nguyên tắc, một cho dữ liệu, một cho code.
+
+---
+
+### Task 6 — Chaos monkey
+
+Bốn điểm gây lỗi, phân bố sau 34 lần chết:
+
+| Điểm | Số lần | Crash ở đây thì warehouse ra sao |
+|---|---|---|
+| `after_read_manifest` | 18 | Chưa đụng gì |
+| `after_stage` | 9 | Bảng tạm mất, warehouse không đổi |
+| `mid_transaction` | 5 | DELETE đã chạy, INSERT chưa |
+| `before_commit` | 2 | Đã INSERT nhưng chưa COMMIT |
+
+**Phân bố hình thang là đúng, không phải bug.** Tới được điểm sau nghĩa là đã sống
+sót qua mọi lần tung xúc xắc trước. Với chaos 0.6: 60% / 24% / ~10% / ~4%.
+
+**Checksum không đổi qua tất cả**: 62707 / 15477265932102261913. Năm lần
+`mid_transaction` là bằng chứng mạnh nhất — không có transaction thì đó là năm lần
+mất trắng một ngày dữ liệu, im lặng. Có transaction thì `ROLLBACK` hoàn tác DELETE.
+
+**Không dòng nào kẹt ở `running`**: 7 + 34 = 41, khớp đúng số run_id đã cấp. Vì
+`fail_run()` nằm trong `except` và `UPDATE ... success` nằm trong transaction.
+
+---
+
+### Task 7 — Retry với exponential backoff
+
+Backoff quan sát được: **1.0s → 2.0s → 4.0s → 8.0s → 16.0s → 30.0s → 30.0s**, chạm
+trần `max_delay`.
+
+**`with_retry` chỉ bắt `TransientError`.** Trong `load_day()`, `if staged == 0: raise
+ValueError(...)` là **dữ liệu sai** — file rỗng thì thử lại một triệu lần vẫn rỗng.
+Retry không sửa được, và mỗi lần thử vô ích lại chôn sâu thêm nguyên nhân thật. Lỗi
+`BinderException` ở Task 9 chứng minh điều này trong thực tế: nó fail ngay, không
+retry.
+
+Đây là quy tắc bị bỏ qua nhiều nhất trong thiết kế retry: `except Exception` rồi
+retry tất.
+
+**Alert:** mỗi lần bỏ cuộc ghi đúng một dòng `ops.alerts`, severity `error`, `run_id`
+là lần thử **cuối cùng**. Chính sách retry và chính sách cảnh báo là hai quyết định
+khác nhau — một load bỏ cuộc trong im lặng thì không ai biết dữ liệu hôm nay thiếu.
+
+**Đánh đổi `max_attempts`:** đặt 1 thì mọi lỗi thoáng qua đều thành alert, người
+trực học cách bỏ qua alert. Đặt quá cao thì lỗi thật bị giấu hàng chục phút. Không
+có số đúng.
+
+---
+
+### Task 8 — Phần chứng minh
+
+**8a — bốn checksum.** Ba đường đi khác nhau tới cùng một kết quả:
+
+| run_id | Đường đi | Checksum |
+|---|---|---|
+| 42 | chạy sạch, thành công ngay | 15477265932102261913 |
+| 54 | fail 1 lần rồi thành công | y hệt |
+| 57 | fail 2 lần rồi thành công | y hệt |
+| — | skip check (không `--force`) | ~1 giây, không cấp run_id |
+
+Một lần chạy crash 5 lần trên đường đi **không phân biệt được** với một lần chạy
+trơn tru. Và lần `--max-attempts 10` bỏ cuộc hoàn toàn (run 43–52) cũng không làm
+hỏng gì: bảng vẫn nhất quán, và đã báo động qua `ops.alerts`.
+
+**8b — truy vết, đòi lời hứa của A03.**
+
+`DESCRIBE core.orders`: 13 cột, trong đó đúng **hai** cột lineage. Ít hơn bản năng
+muốn.
+
+```
+order_id  _data_date  _run_id | source_file            finished_at    status   rows
+1530041035 2026-06-03      57 | orders_2026-06-03.csv  09:57:57.336   success  62707
+```
+
+Bất kỳ dòng nào cũng cho cùng câu trả lời — đó là điểm mấu chốt. Mọi dòng mang
+`_run_id = 57`, lần thử thành công cuối. Những lần thất bại trước có cái đã đi tới
+INSERT (`before_commit` fail 2 lần), nhưng ROLLBACK xoá sạch; chỉ ledger và file log
+còn nhớ.
+
+**Điểm yếu phát hiện được:** docstring nói `logs/run_<run_id>.log` nhưng thực tế tên
+file dùng timestamp, vì một lần gọi script sinh nhiều `run_id` (mỗi attempt một cái).
+File `run_2026-06-03_1788836273.log` chứa run 55, 56, 57. Tra ngược phải grep:
+`Select-String -Path logs\*.log -Pattern "run_id=57 "`.
+
+Cũng có file log **0 byte** — lần bị preflight chặn vì warehouse khoá. Logger tạo
+file rồi script thoát trước khi ghi gì. Không đẹp, nhưng nói đúng sự thật: lần chạy
+đó không làm gì cả.
+
+---
+
+### Task 9 — Full scale
+
+Ba ngày, 3.65 triệu dòng, **13 giây**. RAM 1–2 GB nhờ streaming.
+
+**Force chạy lại 1.2 triệu dòng: ~3 giây, checksum không đổi** (9351036678762254023).
+Chạy lại một ngày không phải chuyện phải cân nhắc.
+
+**Đối soát manifest — khớp chính xác cả ba ngày:**
+
+| Ngày | manifest.rows | loaded |
+|---|---|---|
+| 2026-06-01 | 1,214,064 | 1,214,064 |
+| 2026-06-02 | 1,180,490 | 1,180,490 |
+| 2026-06-03 | 1,254,150 | 1,254,150 |
+
+Đó là `quality.reconciliation` của contract A06 — chuỗi từ A06 sang A07 khép lại ở
+đây.
+
+**`runs = 1` cho mọi ngày.** Ngày 06-01 load ba lần (run 4, 7, 8) nhưng chỉ run 8 sở
+hữu dữ liệu — hai lần trước bị DELETE xoá sạch. Không dòng nào mồ côi từ lần chạy cũ.
+
+---
+
+### New knowledge & Core insights
+
+- **Idempotency là thuộc tính của KẾT QUẢ, không phải của số lần chạy.** Chạy một
+  lần hay mười lần, crash giữa chừng hay trơn tru, trạng thái đích phải giống hệt.
+  Cách đo là checksum, không phải cảm giác.
+- **Delete-then-insert trong một transaction** là cách đạt idempotency đơn giản nhất
+  cho ETL theo ngày. DELETE chạy cả lần đầu để lần đầu và lần chạy lại đi cùng một
+  nhánh code.
+- **Checksum phải độc lập thứ tự.** `bit_xor(hash(...))` gom bằng phép giao hoán nên
+  thứ tự dòng không ảnh hưởng — điều bắt buộc khi engine chạy song song. `count(*)`
+  quá thô (đổi nội dung mà giữ số dòng thì không thấy); `string_agg` rồi hash thì đỏ
+  ngẫu nhiên.
+- **Chỉ retry lỗi tạm thời.** Phân loại lỗi TRƯỚC khi quyết định retry là quyết định
+  thiết kế, không phải chi tiết cài đặt. `except Exception` rồi retry tất sẽ lặp lại
+  lỗi tất định tới hết số lần thử và chôn stack trace thật.
+- **Ledger ghi mọi LẦN THỬ, không ghi mọi NGÀY.** Lịch sử thất bại là dữ liệu vận
+  hành: nó cho biết pipeline hỏng ở đâu, bao lâu một lần, và lần cuối thành công là
+  khi nào.
+- **Thuộc tính của lần chạy thì lưu ở lần chạy.** Đây là normalization áp cho
+  metadata, không riêng cho dữ liệu nghiệp vụ.
+- **Preflight là shift-left của A06 dời thêm một bậc.** A06 kiểm dữ liệu trước khi
+  nạp; A07 kiểm môi trường trước khi đọc. Cả hai đều rẻ, và cả hai đều trả về mã
+  thoát.
+
+### Observations to carry forward
+
+- Một file DuckDB, một process ghi. Notebook và terminal không dùng chung được —
+  `con.close()` trước khi chạy script.
+- `--force` là công tắc an toàn: mặc định skip ngày đã thành công, muốn nạp lại phải
+  nói rõ.
+- Kernel restart làm mất `con`, `section`, `DAY`, `CHECKSUM_SQL`. Cell nào có `DROP`
+  hay `CREATE TABLE` không kèm `IF NOT EXISTS` thì đọc kỹ trước khi chạy lại.
+- Warehouse small và full là hai file riêng, mỗi cái có `ops.run_id_seq` riêng — nên
+  run_id đánh số độc lập.
+- `preflight.py` nằm thẳng trong `work/` chứ không trong thư mục con, vì A11 sẽ
+  import nó trước từng ngày backfill.
