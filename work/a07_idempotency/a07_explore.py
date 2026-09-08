@@ -241,7 +241,15 @@ section("TASK 6 — pipeline chưa từng crash giữa chừng là pipeline chư
 # xúc xắc trước đó, nên các điểm sau hiếm dần theo hàm mũ. Với chaos 0.6,
 # before_commit chỉ nổ ở ~4% số lần chạy; thấy được nó có thể mất 20-30 lần.
 # Đó là xác suất, không phải lỗi trong cách bạn gắn maybe_fail.
+# %%
+con.sql("""
+    SELECT error, count(*) AS n FROM ops.etl_runs
+    WHERE status='failed' GROUP BY 1 ORDER BY 2 DESC
+""").show()
 
+con.sql("SELECT status, count(*) FROM ops.etl_runs GROUP BY 1").show()
+# %%
+con.close()  
 # %%
 # Sau MỖI lần crash, chạy lại checksum:
 con.sql(CHECKSUM_SQL).show()
@@ -324,6 +332,14 @@ con.sql(f"""
 # Giờ mở logs/run_<id đó>.log: tiểu sử của dòng dữ liệu gói trong một file.
 # dòng -> lần chạy -> log là chuỗi audit, và bạn vừa đi hết nó.
 
+# %%
+con_full = duckdb.connect(str(warehouse_path("full")))
+con_full.sql("""
+    SELECT count(*) AS n,
+           bit_xor(hash(order_id, updated_at, status, order_total)) AS checksum
+    FROM core.orders WHERE _data_date = DATE '2026-06-01'
+""").show()
+con_full.close()
 # %% ── Task 9 — scale full ──────────────────────────────────────────────
 section("TASK 9 — cùng code, khối lượng thật")
 
@@ -383,5 +399,33 @@ con.sql("SELECT severity, run_id, message FROM ops.alerts ORDER BY alert_ts DESC
 #    đúng con số manifest — giờ bạn KHÔNG THỂ tạo ra trạng thái ở giữa nữa
 con.sql("SELECT _data_date, count(*) FROM core.orders GROUP BY 1 ORDER BY 1").show()
 
+#%%
+import json
+con_full = duckdb.connect(str(warehouse_path("full")))
+for d in ["2026-06-01", "2026-06-02", "2026-06-03"]:
+    m = json.loads((data_root("full") / "raw" / "manifest" / f"orders_{d}.json").read_text())
+    loaded = con_full.execute(
+        "SELECT count(*) FROM core.orders WHERE _data_date = ?", [d]).fetchone()[0]
+    print(f"{d}: manifest={m['rows']}  loaded={loaded}  {'OK' if m['rows']==loaded else 'MISMATCH'}")
+con_full.close()
 # %%
 con.close()
+
+# %%
+con_full = duckdb.connect(str(warehouse_path("full")))
+
+# đúng MỘT run sở hữu mỗi ngày
+con_full.sql("""
+    SELECT _data_date, count(DISTINCT _run_id) AS runs, count(*) AS rows
+    FROM core.orders GROUP BY 1 ORDER BY 1
+""").show()
+
+# không dòng nào kẹt ở 'running'
+con_full.sql("SELECT status, count(*) FROM ops.etl_runs GROUP BY 1").show()
+
+# ngân sách cột lineage: đúng HAI
+con_full.sql(r"""SELECT column_name, column_type FROM (DESCRIBE core.orders)
+                 WHERE column_name LIKE '\_%' ESCAPE '\'""").show()
+
+con_full.close()
+# %%
