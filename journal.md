@@ -816,3 +816,134 @@ hữu dữ liệu — hai lần trước bị DELETE xoá sạch. Không dòng n
   run_id đánh số độc lập.
 - `preflight.py` nằm thẳng trong `work/` chứ không trong thư mục con, vì A11 sẽ
   import nó trước từng ngày backfill.
+
+
+# A08 — Append vs Upsert vs Partition Refresh
+
+**Ngày:** 2026-09-08 · **Branch:** `a08-load-strategies` · **Cửa sổ:** 2026-06-01 → 2026-06-10 (10 file)
+
+Ba cách nạp cùng một tập dữ liệu, chứng minh chúng cho ra cùng một trạng thái hiện hành tới từng dòng, rồi chọn một cái để dùng.
+
+---
+
+## 1. Số đo
+
+### Dữ liệu đầu vào (từ manifest)
+
+| | small | full | tỉ lệ |
+|---|---|---|---|
+| rows | 577.673 | 11.553.524 | 20,0× |
+| late_rows | 7.750 (1,34%) | 155.088 (1,34%) | — |
+| dup_rows | 284 (0,05%) | 5.773 (0,05%) | — |
+
+`dup_rows` nằm dưới ngưỡng contract `within_file_exact_resends: 0,2%` → nhiễu at-least-once bình thường, không phải sự cố.
+
+### Ba chiến lược
+
+| | dòng ghi (small / full) | thời gian (small / full) | ghi/nhận | chi phí đọc | lịch sử | file bất biến |
+|---|---|---|---|---|---|---|
+| append + view | 577.673 / 11.553.524 | 2,3s / 24,7s | 1,0× | **0,040s / 2,131s** | đầy đủ | được |
+| upsert (MERGE) | 575.494 / 11.509.661 | 3,8s / 59,1s | 1,0× | 0 | mất | **không** |
+| partition refresh | 2.980.603 / 59.611.485 | 3,4s / 66,7s | **5,2×** | 0 | mất | **được — duy nhất** |
+
+Refresh còn xoá 2.410.964 (small) / 48.218.822 (full) dòng.
+
+### Kết quả reconcile
+
+| | small | full |
+|---|---|---|
+| ba chiến lược | 569.639 | 11.392.663 |
+| bốn phép diff EXCEPT | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+
+### Số phụ
+
+| | small | full |
+|---|---|---|
+| order_id ở nhiều hơn một file | 7.684 (1,35%) | 153.678 (1,35%) |
+| chồng lấn 06-01 ∩ 06-02 | 883 đơn (late_rows ghi 885 dòng) | — |
+| dòng bị MERGE từ chối | ~1.895 | 38.090 |
+| `null_dates` sau COALESCE | 0 | 0 |
+
+---
+
+## 2. Những chỗ suýt sai
+
+**Chồng lấn 883 vs late_rows 885.** `INTERSECT` đếm **đơn hàng phân biệt**, `late_rows` đếm **dòng**. Hai đơn được sửa hai lần trong cùng file 06-02 → góp 2 dòng nhưng 1 đơn. Cùng lời giải thích cho 7.684 vs 7.750 ở quy mô 10 file.
+
+**`order_date` không được phép NULL.** `try_strptime` trả NULL cho timestamp hỏng (~0,02% dòng). `NULL BETWEEN x AND y` cho ra NULL chứ không phải TRUE → dòng đó không lọt qua `WHERE` nào của chiến lược C, không được insert, không bị delete. Mất dòng, không lỗi, không cảnh báo. `COALESCE(..., DATE '{d}')` là cái lưới hứng. Dòng `null_dates = 0` trong output là bằng chứng lưới hoạt động.
+
+**MERGE không báo lỗi khi nguồn có key trùng.** Nó chọn bừa một dòng rồi báo thành công. Phải dedupe staging trước — đó là `TEMP TABLE stg_day`.
+
+**Điều kiện chặn `s.updated_at > t.updated_at`.** Bỏ nó đi thì MERGE vẫn chạy, count cuối vẫn đúng 11.392.663, nhưng 38.090 đơn bị kéo ngược về phiên bản lỗi thời. Không test count-based nào bắt được.
+
+**Hình dạng query của chiến lược C.** Dedupe **toàn cục** trên log as-of trước, **rồi** mới lọc theo cửa sổ. Lọc trước rồi dedupe là sai: bản thắng thật của một đơn có thể nằm ngoài cửa sổ, dedupe cục bộ sẽ làm sống lại phiên bản cũ. Ở small hai cách cho kết quả giống hệt; ở full cách sai để lại 7 đơn trùng.
+
+---
+
+## 3. Cửa sổ sai — bài học đắt nhất
+
+Chạy lại chiến lược C với cửa sổ ngây thơ `[D, D]` thay vì `[D−7, D]`:
+
+| | count | diff nội dung |
+|---|---|---|
+| cửa sổ đúng | 569.639 | 0 |
+| cửa sổ sai | 569.640 | **5.824** |
+
+Count lệch **1** (0,0002%). Nội dung sai **5.824 dòng** (1,02%).
+
+Mọi đơn có phiên bản hiện hành là bản sửa đều kẹt ở bản gốc cũ, vì bản sửa rơi vào partition cũ hơn mà cửa sổ hẹp không chạm tới.
+
+**Đếm không phải là reconcile.** Count trả lời "có bao nhiêu dòng", không trả lời "có đúng những dòng đó không". Phải diff nội dung, và phải cả hai chiều — `A − B = 0` chỉ nói A là tập con của B.
+
+Con số 7 trong `[D−7, D]` đến từ `late_corrections.window_days` của contract A06. Không có cam kết bằng văn bản thì cửa sổ chỉ là phỏng đoán.
+
+---
+
+## 4. Truy vết đơn `1510000111`
+
+| _data_date | status | order_total | updated_at | |
+|---|---|---|---|---|
+| 2026-06-02 | refunded | 435,92 | 2026-06-02 00:10:35 | ← thua |
+| 2026-06-01 | delivered | 84,48 | 2026-06-02 20:27:19 | ← bản gốc |
+| 2026-06-06 | refunded | 230,65 | 2026-06-06 07:53:51 | ← thắng |
+
+Bản trong file 06-02 mang `updated_at` **sớm hơn** bản trong file 06-01. File về sau, nội dung cũ hơn. Xếp hạng theo `_data_date` sẽ chọn nhầm `435,92` — sai gần gấp đôi giá trị, count không nhúc nhích.
+
+**Thứ tự file không có ý nghĩa gì. Chỉ `updated_at` mới xếp hạng được.**
+
+Cả ba chiến lược đều chọn `refunded / 230,65`. Ba cơ chế khác nhau (`row_number()`, điều kiện chặn của MERGE, dedupe as-of) cùng thực thi một điều khoản contract: *latest updated_at wins*.
+
+Nhìn từ nghiệp vụ: đơn ngày 01/06 chỉ được biết là đã hoàn tiền vào 06/06 — trễ năm ngày. Báo cáo doanh thu chốt ngày 02/06 ghi nhận đơn này là bán được, và con số đó **không sai** ở thời điểm chốt, chỉ lỗi thời.
+
+---
+
+## 5. Quyết định
+
+**Dùng partition refresh cho `core.orders`, giữ append log làm nguồn bền vững.**
+
+Chi phí dedupe không mất đi, chỉ đổi chỗ: view trả 2,13s ở *mỗi lượt đọc*, refresh trả một lần lúc ghi. Đọc xảy ra hàng nghìn lần mỗi ngày → dời chi phí sang phía ghi là đúng chiều.
+
+Giá 5,2× dòng ghi rẻ hơn vẻ ngoài: 66,7s so với 59,1s của upsert, chỉ chậm 13%, vì ghi tuần tự theo lô rẻ hơn 11,5 triệu lần dò tìm key rời rạc. **Nhưng đây là đánh đổi có điều kiện** — rẻ *vì cửa sổ chỉ 7 ngày*. Contract cho 30 ngày thì tỉ lệ ghi vọt lên và upsert thắng ngược.
+
+Điểm quyết định là tương thích: Parquet bất biến, không update tại chỗ. Refresh là chiến lược **duy nhất** dùng được cho file lake. Upsert khoá pipeline vào warehouse vĩnh viễn.
+
+Giữ log vì nó là thứ duy nhất trả lời được "ta biết điều này từ khi nào", và là bảo hiểm nếu logic dedupe hôm nay hoá ra sai.
+
+**Nhược điểm phải thừa nhận:** refresh chỉ idempotent ở ngày mới nhất. Chạy lại ngày D cũ hơn sẽ tua `[D−7, D]` về trạng thái as-of D, xoá mất bản sửa về sau. Rerun không phải "chạy lại một ngày" mà là backfill từ D cuốn tới — A11 dựng runner đó.
+
+**Lỗ hổng còn nguyên:** trong lúc `DELETE` xong mà `INSERT` chưa xong, người đọc thấy gì? Transaction A07 che được người đọc trong warehouse. Nếu `core.orders` nằm ở lake dạng Parquet thì không có transaction nào cả → **A09**.
+
+---
+
+## 6. Ghi chú hiệu năng
+
+- append: small 2,3s → full 24,7s, tức **10,7× thời gian cho 20× dữ liệu**. Tốt hơn tuyến tính vì chi phí cố định bị nuốt gọn và 8 luồng được dùng hiệu quả hơn.
+- Khoản thuế của view **phình ra** theo scale: 13× ở small → **426×** ở full (0,005s vs 2,131s). `count(*)` trên log gần như không đổi (đọc metadata), còn view phải chạy `row_number()` trên toàn bộ 11,5 triệu dòng.
+- 2,131s mới chỉ là `count(*)` — phép đọc rẻ nhất tồn tại. Query thật có join/filter/group by còn tệ hơn.
+- Refresh ghi gấp 5 lần upsert nhưng chỉ chậm 13%: máy tính thích việc lớn và đơn giản hơn việc nhỏ và nhiều.
+
+## 7. Nguyên tắc rút ra
+
+> **Phát triển trên small, đừng bao giờ nghiệm thu trên small.**
+
+Cái bẫy hình dạng query ở Task 5 hoàn toàn im lặng ở scale small và chỉ lộ ra ở full. Không có bước chạy full thì lỗi đó đã lên production.
