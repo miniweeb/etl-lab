@@ -947,3 +947,320 @@ Giữ log vì nó là thứ duy nhất trả lời được "ta biết điều n
 > **Phát triển trên small, đừng bao giờ nghiệm thu trên small.**
 
 Cái bẫy hình dạng query ở Task 5 hoàn toàn im lặng ở scale small và chỉ lộ ra ở full. Không có bước chạy full thì lỗi đó đã lên production.
+
+---
+
+# A09 — Atomic partition swap
+
+Câu hỏi của bài: ghi lại một partition đã publish, trong lúc có người đang đọc
+nó. Ba cách, đo cùng một thứ — người đọc thấy gì trong lúc ghi.
+
+Nạn nhân: `order_date=2026-06-19`, ngày cao điểm.
+
+---
+
+## 1. Số đo
+
+### Trạng thái ban đầu
+
+| | small | full |
+|---|---|---|
+| manifest `rows` | 182.151 | 3.643.024 |
+| manifest `late_rows` | 2.732 | 54.645 |
+| manifest `dup_rows` | 91 | 1.821 |
+| dòng thật trong partition | 180.183 | 3.603.703 |
+| số file Parquet | 8 | 8 |
+
+**Manifest 182.151 nhưng partition chỉ 180.183.** Chênh 1.968. Không phải mất
+dữ liệu — file `orders_2026-06-19.csv` chở 2.732 dòng sửa cho các ngày CŨ HƠN,
+loader A02 đã xếp chúng vào partition khác. Đổi lại, partition 06-19 nhận 764
+dòng sửa từ các file 06-20..06-26. 2.732 − 764 = 1.968.
+
+**8 file** = 1 file gốc + 7 lần các ngày sau gửi late correction về. Một file
+14,5 MB và bảy file 6–17 KB. Bảy file nhỏ tổng 91 KB, tức 0,6% của file chính —
+đúng hình dạng vật lý của con số late 1,34% đo ở A08. Sửa thì ít, nhưng rải ra
+thành nhiều file, và mỗi lần rebuild phải gom hết.
+
+Nếu chỉ thấy 1 file thì loader A02 đã dùng `OVERWRITE_OR_IGNORE` và ăn mất các
+file late correction. Kiểm chỗ này trước khi làm gì khác.
+
+### Cửa sổ đọc sai — con số trung tâm
+
+| scale | naive rewrite | swap |
+|---|---|---|
+| small (180 k dòng) | **1,9 s** | **0,004 s** |
+| full (3,6 M dòng) | **28,7 s** | **0,002 s** |
+
+Dữ liệu gấp 20 lần → naive chậm gấp 15 lần, swap không đổi.
+
+Đây mới là câu kết luận, không phải "swap nhanh hơn": **cửa sổ sai của naive
+tăng theo dữ liệu, của swap thì không.** Naive bắt người đọc chịu thời gian
+*ghi dữ liệu* — tăng theo số byte. Swap bắt họ chịu thời gian *đổi tên thư mục*
+— không tăng, vì filesystem chỉ sửa một mục trong bảng thư mục.
+
+### Sau dedupe
+
+180.183 → **179.294** (small, mất 889 dòng), 3.603.703 → **3.585.850** (full,
+mất 17.853).
+
+Không phải mất dữ liệu. Loader A02 append bản sửa thành file mới mà không xoá
+bản cũ, nên partition đang chứa 889 đơn hàng ở hai phiên bản. `rebuild_sql` giữ
+`updated_at` mới nhất nên gộp còn một. Partition sau khi rebuild ĐÚNG HƠN trước
+— nhưng đúng theo cách khiến mọi người đọc trong 1,9 giây đó nhận số rác.
+
+---
+
+## 2. Ba kiểu người đọc gặp phải
+
+Task 3, naive rewrite, small:
+
+```
+15:54:23.503  count=180183
+15:54:29.890  count=0            ← trả lời sai, không báo lỗi
+15:54:30.759  IOException        ← mở trúng file đang ghi dở
+15:54:31.367  count=179294
+```
+
+`IOException` làm job đỏ, có người bị gọi dậy, sửa. `count=0` chảy thẳng vào
+dashboard, vào email báo cáo, vào quyết định — không ai biết.
+
+Ở Task 6 (`--nap 2`) chỉ còn `count=0`, không có `IOException` nào: thư mục
+biến mất hẳn nên glob không tìm thấy gì, DuckDB trả 0 dòng và không coi đó là
+lỗi. Loại bỏ được lỗi ồn ào không có nghĩa là an toàn hơn.
+
+---
+
+## 3. Chỗ suýt sai đắt nhất — staging đặt trong `orders/`
+
+Task 4. Copy partition thành `order_date=2026-06-19.__tmp__` NGAY TRONG
+`orders/`. Lake **đứng hoàn toàn yên** — không xoá, không ghi, không process nào
+chạy. Reader vẫn đọc ra **358.588 = 179.294 × 2**.
+
+Hai thứ hỏng chồng lên nhau:
+
+1. Glob `orders/*/*.parquet` — `*` không kiểm tra tên, thư mục thừa bị vơ vào.
+2. Filter `WHERE order_date = DATE '2026-06-19'` **vẫn khớp**:
+
+| Tên thư mục | Chuỗi giá trị | Cast thành DATE |
+|---|---|---|
+| `order_date=2026-06-19` | `2026-06-19` | 2026-06-19 |
+| `order_date=2026-06-19.__tmp__` | `2026-06-19.__tmp__` | **2026-06-19** |
+
+Bộ parse DATE của DuckDB đọc được `2026-06-19` ở đầu chuỗi thì dừng, phần
+`.__tmp__` bị nuốt. Không lỗi, không cảnh báo.
+
+**Luật rút ra: staging phải nằm ngoài tầm với của glob mà người đọc dùng.** Đổi
+tên thành `.staging_...` không cứu được — dấu chấm đầu tên chỉ giấu file khỏi
+`ls` trên Linux, `*` của DuckDB vẫn khớp. Nên layout đúng là:
+
+```
+lake/
+  orders/          ← người đọc glob ở đây
+  .staging/        ← anh em, ngoài tầm glob
+  .trash/          ← anh em, ngoài tầm glob
+```
+
+Không phải `lake/orders/.staging/`.
+
+Ghi chú thêm: `order_date=__HIVE_DEFAULT_PARTITION__` có sẵn trong lake từ A02
+thì KHÔNG gây chuyện này — DuckDB nhận diện tên đặc biệt và trả `NULL`, mà
+`NULL = DATE '...'` không bao giờ đúng. Chính partition đó là lý do A08 viết
+`COALESCE(..., DATE '{d}')`.
+
+---
+
+## 4. Swap không atomic — nói thẳng ra
+
+Thay một thư mục đang sống cần **hai** lần rename:
+
+```
+rename 1: live    → .trash
+rename 2: .staging → live
+```
+
+Giữa hai dòng đó partition không tồn tại. `--nap 2` phóng to quãng này và đo
+được **2,05 giây** `count=0` — khớp chính xác.
+
+Swap rút cửa sổ từ 1,9 s xuống 4 ms. Nó **không** đưa về 0.
+
+### Phía đọc bù phần còn lại
+
+`read_with_retry()`: coi `0` và lỗi IO là "đang swap, đọc lại", 15 lần × 0,3 s.
+Chạy lại `--nap 2 --retry` → reader in **một dòng duy nhất**, khoảng trống 2
+giây vẫn còn nguyên ở phía ghi.
+
+Cách này dùng được vì ta BIẾT partition có dữ liệu. Số 0 không phải câu trả
+lời, nó là dấu hiệu đang ở giữa swap.
+
+**Phải làm cả hai bên:**
+
+| Phía ghi | Phía đọc | Kết quả |
+|---|---|---|
+| naive 1,9 s | không retry | thấy `0` — Task 3 |
+| naive 1,9 s | có retry | cứu được, nhưng người đọc chờ gần 2 giây |
+| swap 4 ms | không retry | gần như không trúng — "gần như" không phải "không bao giờ" |
+| swap 4 ms | có retry | trúng cũng đọc lại là xong |
+
+Dòng ba dễ chủ quan. 4 ms nghe an toàn, nhưng 50 dashboard poll liên tục × 30
+partition swap mỗi ngày thì xác suất cộng dồn không còn nhỏ, và khi trúng thì
+reader không có cách nào biết mình đang cầm số sai.
+
+Dòng hai cho thấy retry một mình cũng không đủ: rebuild 30 giây ở full sẽ vượt
+hạn mức 4,5 giây, retry hết lượt và vẫn trả 0.
+
+---
+
+## 5. Crash giữa hai lần rename
+
+`--crash` gọi `os._exit(1)` ngay sau rename 1 — giết process lập tức, không
+chạy `finally`, không dọn dẹp. Hậu quả:
+
+| Thư mục | Trạng thái |
+|---|---|
+| `orders/order_date=2026-06-19` | **không tồn tại** |
+| `.staging/order_date=2026-06-19` | bản mới, đầy đủ |
+| `.trash/order_date=2026-06-19.1788946831` | bản cũ, đầy đủ |
+
+Partition biến mất và **không tự khỏi** — đứng nguyên vậy cho tới khi có người
+sửa.
+
+Sửa được vì **bản mới và bản cũ không bao giờ mất cùng lúc**. Tại mọi thời điểm
+trong `swap()`, ít nhất một trong hai giữ một partition đầy đủ.
+
+`recover()` xét theo thứ tự: live có chưa → staging còn không → trash còn
+không. Ưu tiên staging vì đó là dữ liệu mới hơn — đi tiếp tốt hơn lùi lại. Chạy
+thật: `finished the swap: staging -> live`, số về đúng 179.294.
+
+---
+
+## 6. Warehouse thì atomic thật
+
+Task 8. Trong một transaction: `orders_a09` → `orders_a09_old`, rồi
+`orders_a09_new` → `orders_a09`. Connection thứ hai đếm giữa chừng:
+
+```
+mid-swap  : 2772677     ← bảng CŨ, đầy đủ và đúng
+post-commit: 2769890    ← bảng mới
+```
+
+| | Lake (`--nap 2`) | Warehouse |
+|---|---|---|
+| Người đọc giữa lúc swap | `count=0` suốt 2 giây | số cũ, đúng |
+| Hai lần rename | hai bước tách rời | hiện ra cùng lúc sau COMMIT |
+| Có khoảng trống không | có | không |
+
+Khác biệt: rename bảng chỉ sửa **catalog** — sổ ghi tên nào trỏ tới dữ liệu
+nào. Sổ đó nằm trong transaction nên hai lần đổi tên hoặc cùng hiện ra hoặc
+cùng không. Filesystem không có sổ nào bao trùm cả hai thao tác rename thư mục.
+
+**Hai giới hạn:**
+- Bảo vệ các CONNECTION tới warehouse. Một PROCESS khác thậm chí không mở nổi
+  file khi writer đang giữ — luật một-process-ghi.
+- Không giúp gì cho người đọc Parquet. File nằm ngoài catalog.
+
+Hai bảng `orders_a09` là đạo cụ, đọc thẳng từ lake nên không mang cặp lineage
+§7.2: file lake không chứa `_data_date`, và không có lần chạy nào được đăng ký
+để phát `_run_id`. Bảng `core.orders` thật của A07 thì có đủ.
+
+---
+
+## 7. Versioned directories — cách thứ ba
+
+Task 9. Không sửa thư mục đã publish, một chữ cũng không. Mỗi lần ghi lại thì
+publish nguyên một thư mục version mới, rồi `CREATE OR REPLACE VIEW` trỏ sang.
+
+```
+copytree mất 0,5s
+rebuild trong v2: 1 file -> 1 file, mất 1,3s
+count = 179294
+```
+
+Từ đây consumer query `core.lake_orders`, **không bao giờ query một đường dẫn
+thư mục**. Đổi view là đổi catalog — atomic, giống Task 8.
+
+Trong v2, **xoá tại chỗ là an toàn** — trái ngược hẳn Task 3. Vì chưa ai đọc
+`orders_v=<v2>`, view vẫn trỏ v1. Cả thư mục version mới đóng vai trò staging.
+
+Version cũ nằm nguyên trên đĩa: rollback là trỏ view về v1, không phải khôi
+phục dữ liệu từ đâu cả. Và câu "hôm qua dữ liệu trông thế nào" trả lời được
+bằng cách đọc thẳng `orders_v=<v1>`.
+
+**Cái phải trả là dung lượng.** `copytree` nhân đôi cả lake trong khi chỉ MỘT
+partition trên khoảng ba mươi thực sự đổi. Ở small chép (0,5 s) còn nhanh hơn
+dựng lại (1,3 s) nên chi phí chưa lộ. Ở full lake nặng gấp 20 lần thì chép
+thành hàng chục giây, vẫn chỉ để thay một partition.
+
+Đây là lý do Iceberg và Delta Lake tồn tại: giữ ý tưởng con trỏ version, nhưng
+theo dõi từng file trong metadata thay vì sao chép cả cây thư mục. Version N+1
+dùng lại mọi file không đổi, chỉ partition được ghi lại mới chiếm thêm chỗ.
+
+---
+
+## 8. `.trash` chỉ lớn dần
+
+Sau buổi: 4 thế hệ ở small, 1 ở full — đúng bằng số lần swap chạy trọn.
+
+Script **không có** bước dọn, và cố ý vậy: xoá bản cũ ngay lúc publish là mất
+đường rollback. Nhưng giữ mãi thì mỗi lần ghi lại một partition tốn thêm một
+bản đầy đủ trên đĩa.
+
+Cần một chính sách — giữ N thế hệ gần nhất, hoặc xoá thế hệ cũ hơn X ngày.
+Không ai làm hộ. Cùng câu hỏi với `orders_v=*`: giữ bao nhiêu version. Iceberg
+gọi việc này là expire snapshots, và nó là công việc phải chạy định kỳ chứ
+không tự động.
+
+---
+
+## 9. Quyết định
+
+| Tình huống | Chọn | Vì |
+|---|---|---|
+| Ghi lại partition trong lake, có người đọc | swap thư mục + retry phía đọc | cửa sổ 4 ms không tăng theo dữ liệu |
+| Thay bảng trong warehouse | rename trong transaction | catalog cho atomic thật, không hở |
+| Cần rollback / đọc lại lịch sử | versioned dir + view | trỏ view, không khôi phục dữ liệu |
+| Lake lớn, cần cả hai thứ trên | table format (Iceberg/Delta) | con trỏ version mà không chép cây thư mục |
+
+Naive rewrite: không có tình huống nào. Nó chỉ đúng khi chắc chắn không ai đọc,
+mà điều đó thì không chứng minh được.
+
+---
+
+## 10. Nguyên tắc rút ra
+
+1. **Đừng sửa thứ người đọc đang nhìn.** Dựng ở chỗ khuất, publish bằng một
+   thao tác không di chuyển dữ liệu.
+2. **Staging phải nằm ngoài tầm glob của người đọc.** Anh em của `orders/`,
+   không phải con.
+3. **`0` không phải câu trả lời khi biết dữ liệu phải có.** Phía đọc từ chối
+   tin vào kết quả rỗng là một phòng thủ hợp lệ.
+4. **Hai bên cùng chịu trách nhiệm.** Phía ghi thu cửa sổ, phía đọc retry. Một
+   mình bên nào cũng còn hở.
+5. **Nói thẳng cái mình không làm được.** Swap không atomic. Gọi nó là atomic
+   thì lần crash đầu tiên sẽ dạy lại.
+6. **An toàn khi crash đến từ việc không bao giờ mất cả hai bản cùng lúc**, chứ
+   không phải từ việc thao tác nhanh hơn.
+7. **Đo bằng cái người đọc thấy**, không phải bằng thời gian job chạy. Job xanh
+   trong khi dashboard trả số 0 vẫn là hỏng.
+8. **Rollback phải rẻ hơn khôi phục.** Giữ bản cũ có chi phí đĩa; chi phí đó
+   nhỏ hơn dựng lại từ raw lúc 2 giờ sáng.
+
+---
+
+## Observations to carry forward
+
+- Naive rewrite hỏng **dần theo kích thước** — 1,9 s ở 180 k dòng, 28,7 s ở 3,6
+  M. Mọi cách hỏng theo kiểu này đều trông ổn trên máy dev.
+- `CAST('<date>.<gì đó>' AS DATE)` của DuckDB nuốt phần đuôi im lặng. Đây là
+  bẫy chung của hive partitioning, không riêng bài này.
+- File dựng lại phải khớp **chính xác** schema các file lake còn lại. `EXCLUDE
+  order_date` (giá trị nằm ở tên thư mục) nhưng **GIỮ** `order_ts_clean` (loader
+  A02 đã ghi vào mọi file). Thừa hay thiếu cột đều làm mọi lần đọc bằng glob
+  chết vì schema mismatch.
+- Rename trên Windows thất bại với `PermissionError` khi bất kỳ process nào
+  đang mở file bên trong. Cần vòng retry ngắn ở phía ghi, nếu không lỗi đầu
+  tiên sẽ giết script đúng vào lúc tệ nhất — sau rename 1, trước rename 2.
+- `os._exit()` khác `sys.exit()`: không chạy `finally`, không dọn dẹp. Đó là
+  thứ mô phỏng đúng mất điện.
+- A09 chạy script kiểu đường dẫn (`python work\a09_atomic_swap\a09_reader.py`)
+  chứ không `-m`, vì `from a09_common import` cần `sys.path[0]` là thư mục con.
+  Trộn hai kiểu là gãy import.
