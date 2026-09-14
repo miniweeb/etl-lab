@@ -1264,3 +1264,365 @@ mà điều đó thì không chứng minh được.
 - A09 chạy script kiểu đường dẫn (`python work\a09_atomic_swap\a09_reader.py`)
   chứ không `-m`, vì `from a09_common import` cần `sys.path[0]` là thư mục con.
   Trộn hai kiểu là gãy import.
+
+---
+
+# A10 — Schema evolution: month 2 arrives
+
+shopcore ship export v2 (16/07) và v3 (01/08), báo sau khi đã ship, kèm câu
+"should be backwards compatible". Không hề. Bài này: phát hiện drift, phân loại
+mức nguy hiểm, gộp ba era vào MỘT canonical schema để hạ nguồn không bao giờ
+phải biết dòng đến từ era nào.
+
+---
+
+## 1. Đã làm gì
+
+| Task | Việc | Kết quả |
+|---|---|---|
+| 0 | `a10_restore_0619.py` — trả partition 06-19 về trạng thái A02 | tiền đề, xem §2 |
+| 1 | Sinh month 2 cả hai scale | 69 file + 69 manifest |
+| 2 | Cố tình chạy loader A02 vào file v2/v3 | hỏng, thông báo lỗi đánh lạc hướng |
+| 3 | Dò era bằng header, phân loại drift | 45/16/8 file, 3 header |
+| 4 | Thiết kế canonical schema | 16 cột + cặp lineage |
+| 5 | `V3_COLS` + ba aligner | 15 cột giống hệt nhau cho mọi era |
+| 6 | `staging.shopcore_orders_canon` + ba phép kiểm | đều đạt |
+| 7 | Dựng lại toàn bộ lake theo canonical | small và full, identity đóng |
+| 8 | Amendment 2.0.0 + 3.0.0, gate theo era, sửa check A05 | 68 green, 1 unreadable |
+| 9 | Viết lại | §8 |
+
+Code: `work/a10_schema_evolution/` — `a10_bootstrap.py`, `a10_canonical.py`,
+`a10_restore_0619.py`, `a10_rebuild_lake.py`, `a10_gate_eras.py`,
+`a10_explore.py`. Contract: `contracts/shopcore_orders_daily.v2.contract.yaml`,
+`.v3.contract.yaml`.
+
+---
+
+## 2. Tiền đề: A09 để lại một cái bẫy
+
+A09 dedupe lấy 889 dòng (small) / 17.853 (full) ra khỏi partition 06-19. Đó là
+kết quả ĐÚNG của A09. Nhưng Task 7d đối soát lake với manifest thô, mà manifest
+không biết gì về dedupe — migrate từ lake hiện tại sẽ ra 4.056.748 thay vì
+4.057.637, và mất thời gian truy một sai lệch do chính mình tạo ra ở bài trước.
+
+`a10_restore_0619.py` dựng lại partition đó từ tám file raw (06-19..06-26, vì
+late window là D+7), dời bản cũ sang `.trash` chứ không xoá.
+
+**Luật rút ra: kết quả đúng của một bài có thể là tiền đề sai của bài sau.**
+Trước khi đối soát với nguồn ngoài, kiểm xem chính mình đã sửa gì.
+
+---
+
+## 3. Ba era
+
+| Era | Ngày | File | Đổi gì |
+|---|---|---|---|
+| v1 | 06-01 → 07-15 | 45 | 10 cột quen thuộc |
+| v2 | 07-16 → 07-31 | 16 | thêm `currency`, `discount_amount`, `channel` ở CUỐI + đổi nghĩa `order_total` |
+| v3 | 08-01 → 08-08 | 8 | `order_id` thành VARCHAR, `payment_method` → `payment_type`, thêm `loyalty_tier`, `items` thêm `disc`, ĐỔI THỨ TỰ CỘT |
+
+Dò era bằng **header**, không bằng kiểu dữ liệu sniff được: kiểu dao động theo
+rác lọt vào mẫu, header thì ổn định và rẻ.
+
+### Bảng phân loại
+
+| Thay đổi | Loại | Ồn hay lặng | Vì sao |
+|---|---|---|---|
+| 3 cột thêm ở cuối (v2) | additive | ồn — nhưng chỉ vì loader ghim 10 cột | sniffer bó tay, báo lỗi dialect |
+| `order_total` đổi nghĩa (v2) | semantic | **lặng** | không cột nào đổi; consumer vẫn chạy, vẫn ra số, và sai |
+| `payment_method` → `payment_type` | rename | **lặng** dưới `union_by_name` | thành hai cột, mỗi cột nửa NULL, không lỗi |
+| `order_id` BIGINT → VARCHAR | type | **lặng** khi join | `'ORD-...'` không bao giờ bằng số |
+| `items` thêm `disc` | nested add | **lặng** | struct cast thiếu field thì rơi giá trị, không kêu |
+| `loyalty_tier` thêm | additive | ồn (cùng lý do v2) | |
+| Đổi thứ tự cột (v3) | reorder | **lặng** với reader theo vị trí | `columns=` map theo VỊ TRÍ; nạp `'USD'` vào `items`, không lỗi |
+
+Sáu trên bảy là lặng.
+
+### Đây còn là sự cố quy trình
+
+`change_management.notice_breaking`: rename hoặc đổi kiểu là MAJOR, phải báo
+trước **30 ngày** qua `#shopcore-data-changes`, kèm semver MAJOR và ghi chú
+migration. Ngay cả phần thêm cột của v2 cũng cần **7 ngày**
+(`notice_additive`). shopcore ship cả hai era rồi mới gửi email.
+
+Trích được điều khoản là thứ biến "dữ liệu hỏng" thành sự cố có chủ sở hữu.
+
+---
+
+## 4. Task 2 — thông báo lỗi đánh lạc hướng
+
+Loader A02 chạy vào file v2 và v3 đều chết với:
+
+> *It was not possible to automatically detect the CSV parsing dialect*
+
+Không một chữ nào về "thừa 3 cột". Ta đưa `read_csv` 10 cột, file có 13, và
+sniffer bỏ cuộc bằng một lỗi **nghe như vấn đề delimiter**.
+
+Gate A06 trên cùng file thì nói thẳng:
+
+```
+[FAIL] orders_2026-07-16.csv
+   - unexpected column(s) ['currency','discount_amount','channel'] - new export
+     version? change_management: additive needs a MINOR bump, 7 days notice.
+```
+
+Gate so header với contract; loader chỉ đọc số cột nó được bảo đọc và không có
+cách nào biết file có bao nhiêu.
+
+Một chi tiết gate còn chưa đúng: với 08-01 nó xếp `payment_type` vào nhóm "cột
+thêm, MINOR". Thực ra đó là nửa còn lại của một rename. Gate thấy hai sự kiện
+rời rạc (một cột mất, một cột xuất hiện) chứ không thấy quan hệ giữa chúng.
+
+---
+
+## 5. `union_by_name` không phải lời giải
+
+Đọc ba file một ngày mỗi era với `union_by_name=true`:
+
+- `order_id` ra **VARCHAR** — chuỗi của v3 ép cả cột lên. Lịch sử BIGINT hết join
+- `payment_method` **và** `payment_type` cùng tồn tại, mỗi cột nửa NULL
+- `customer_id` ra DOUBLE, `updated_at` ra TIMESTAMP WITH TIME ZONE — kiểu trôi theo rác
+
+Nó che được phần thêm cột và **giấu mất** rename. Là công cụ thăm dò, không phải
+công cụ nạp.
+
+---
+
+## 6. Canonical schema — hai luật thiết kế
+
+### Luật 1: backfill bằng đúng loại "không có"
+
+| Cột | v1 nhận | Vì sao |
+|---|---|---|
+| `currency` | `'USD'` | **biết**: v1 là USD theo contract |
+| `discount_amount` | `0` | **biết**: chưa có cơ chế discount |
+| `channel` | `NULL` | **không biết**: không ai đo |
+| `loyalty_tier` | `NULL` | **không biết** |
+
+Đo được hậu quả ngay: ngày v1 (06-02) qua được công thức của era v2
+(`order_total = items_sum − discount_amount`) với **99,39%**, ngang ngày v2
+(99,43%) và v3 (99,39%). Chỉ vì `discount_amount = 0`.
+
+Nếu để `NULL`: phép trừ ra NULL, `abs(NULL) <= 0.01` ra NULL, `FILTER` loại
+sạch, cột `ok` của ngày v1 ra **0**. Không lỗi, không cảnh báo.
+
+**Known value thì điền giá trị, unknown mới để NULL.** Hai cái nghe giống nhau,
+hậu quả ngược nhau.
+
+### Luật 2: giữ cả hai dạng khoá
+
+Late correction vượt biên giới era: file v3 mang bản sửa cho đơn đang nằm trong
+lake dưới dạng BIGINT. Đo trên file 08-01 (small):
+
+```
+join thô  (v.order_id = CAST(h.order_id_num AS VARCHAR))  ->   0 / 705
+canonical (replace(v.order_id,'ORD-','')::BIGINT = ...)   -> 705 / 705
+```
+
+**0 trên 705.** Mỗi bản sửa đó, qua `MERGE` của A08, sẽ được chèn vào như một
+đơn hàng MỚI. Đếm trùng, không lỗi ở đâu cả. Đó là lý do `order_id_num` tồn tại.
+
+### Khoá này là loại gì
+
+`order_id` là **natural key** — đến cùng dữ liệu, do producer đúc. Contract gọi
+nó "shopcore surrogate key", nhưng surrogate là *đối với shopcore*; từ chỗ ta
+ngồi nó là khoá thừa kế, có nghĩa, miễn phí, và **ngoài tầm kiểm soát**. Ta vừa
+chứng kiến nó đổi kiểu dưới chân mình.
+
+Cặp `order_id` VARCHAR + `order_id_num` BIGINT không phải bản vá. Đó là
+**warehouse-controlled canonical key**: shopcore vẫn giữ phần ý nghĩa (đơn nào),
+warehouse sở hữu phần định dạng.
+
+Ba nấc, và chọn nấc nào phụ thuộc **mức tin tưởng khoá của producer sẽ đứng yên**:
+
+- **(a) dùng thẳng khoá producer** — không code, mọi join đọc giống hệt nguồn.
+  Vừa vỡ trên hai mặt: đổi kiểu, và late correction hết khớp (0/705).
+- **(b) canonical hoá** — đang làm. Một biểu thức deterministic cho mỗi era,
+  không thêm state, không lookup, kỹ sư nào cũng suy lại được bằng mắt.
+- **(c) surrogate key thật** — warehouse tự đúc id (sequence hoặc hash), giữ
+  natural key làm thuộc tính thường. Hạ nguồn tách rời hoàn toàn. Giá phải trả:
+  **một lần tra khoá cho mỗi lần nạp**, mà late row khiến lần tra đó phải đụng
+  lịch sử chứ không chỉ batch hôm nay; và thêm một chặng mỗi khi debug đối
+  chiếu với nguồn. Lưu ý nó KHÔNG mua được gì: lần tra vẫn phải khớp
+  `'ORD-0000000123'` với `123`, nên phần canonical hoá không biến mất — nó
+  chuyển vào trong bước gán khoá.
+
+Chọn (b). Bằng chứng là drift vừa phân loại ở §3, không phải sở thích.
+
+---
+
+## 7. Task 7 — dựng lại lake
+
+Kế hoạch: migrate month 1 từ **Parquet lake đã có** (không parse lại 45 CSV) →
+nạp month 2 từ raw CSV theo ngày → tất cả vào MỘT thư mục versioned mới →
+verify → mới đổi view. Pattern A09 số 3.
+
+| | small | full |
+|---|---|---|
+| manifest (trừ 07-22) | 4.058.440 | 81.169.464 |
+| lake rows | 4.057.637 | 81.153.228 |
+| dropped | 803 | 16.236 |
+| identity đóng | ✓ | ✓ |
+| partition | 69 | 69 |
+| wall-clock | 37 s | 331 s |
+
+**`APPEND` chứ không `OVERWRITE_OR_IGNORE`.** Mỗi lần COPY đặt tên file lại từ
+`data_0.parquet`. Late row khiến ngày D ghi vào partition D−7..D — đúng những
+thư mục ngày trước đã ghi. Với `OVERWRITE_OR_IGNORE`, `data_0.parquet` của ngày
+D đè lên file ngày trước trong partition dùng chung, im lặng. Đề nói đã thử:
+lake 4 triệu dòng ra còn 45 nghìn, không lỗi ở đâu.
+
+Hệ quả: **script dùng `APPEND` thì chạy lại KHÔNG idempotent.** A07 giải quyết
+bằng DELETE trước INSERT; ở đây thư mục version mới đóng vai trò đó — mỗi lần
+dựng lại phải bắt đầu từ thư mục rỗng.
+
+**69 partition dù chỉ 68 file nạp được.** Các file 07-23..07-29 mang late
+correction cho đơn ngày 07-22, nên thư mục `order_date=2026-07-22` vẫn có dữ
+liệu — chỉ thiếu phần đơn gốc của chính ngày đó.
+
+**07-22 ghi `failed` vào `ops.etl_runs`, KHÔNG sửa.** Chẩn đoán và sửa file đó
+là trọng tâm A11.
+
+**Dropped lệch giữa hai nửa:** month 1 bỏ 553, month 2 bỏ 250 (small). Month 1
+nhiều gấp đôi dù chỉ nhiều hơn 45/24 ngày — vì lake A02 giữ
+`__HIVE_DEFAULT_PARTITION__`, chỗ chứa những dòng timestamp hỏng. `CANON` parse
+lại và loại chúng, nên **lake canonical không còn partition NULL nào**. Đó là
+thay đổi hình dạng, không chỉ là một con số.
+
+Lake không nhận cặp lineage §7.2 — nó ở lại `staging`. Parquet dưới `lake/` là
+kho suy lại được, không phải bảng warehouse; và nửa month 1 là migration hàng
+loạt các file A02 đã ghi, ngày giao của chúng mất rồi. `order_date` không thay
+thế được (late row chính là những dòng có ngày file khác ngày đơn). Một lake
+sạch lineage đồng đều tốt hơn một lake chỉ đóng dấu nửa mình biết. Cặp đó hạ
+cánh xuống `core.orders` ở A11.
+
+---
+
+## 8. Task 8 — tiến hoá contract
+
+### Hai amendment
+
+**2.0.0** (hiệu lực 07-16) — ba cột thêm, VÀ luật reconciliation mới. Thêm cột
+thôi thì minor; **viết lại nghĩa của một business rule đang có mới là thứ phá
+mọi consumer**: không dòng code nào đổi, consumer vẫn chạy, vẫn ra số, và sai.
+Đó là MAJOR, và đúng là lý do điều khoản 30 ngày áp dụng.
+
+Gộp luôn hai clause của amendment v1.4.0 (transport locale, `updated_at`
+semantics) — nó kẹt ở `proposed` từ A06 vì shopcore chưa bao giờ ký. Đề xuất lỡ
+một chuyến thì đi chuyến sau.
+
+**3.0.0** (hiệu lực 08-01) — breaking trên bốn mặt: rename, đổi kiểu id,
+`loyalty_tier`, `items.disc`, đổi thứ tự cột.
+
+Mỗi bản mang `effective_from` riêng, nên gate giữ được cả ba và kiểm mỗi file
+theo bản có hiệu lực vào ngày của nó.
+
+Pydantic model chặn ngay ba khoá mới (`extra="forbid"`): phải khai
+`transport_locale` trong `Money`, `semantics` trong `Column`, `supersedes` trong
+`Contract`. Model làm đúng việc — đó là lý do nó tồn tại.
+
+### Gate phân biệt "drift" với "không đọc nổi"
+
+Gate A06 chạy trên file 07-22 báo:
+
+```
+- missing column(s) [tất cả 10 cột]
+- unexpected column(s) ['"order_id","customer_id",...,"channel"']
+```
+
+Cái cột "thừa" đó là **cả dòng header 13 cột gộp thành tên một cột duy nhất**.
+`sniff_csv` không ném lỗi — nó thoái hoá: dòng gãy làm hỏng việc dò dialect,
+sniffer chốt một delimiter không có trong dữ liệu.
+
+Gate kết luận "schema drift" cho một file **không drift chút nào** — nó có đúng
+13 cột như mọi file v2 khác, chỉ gãy ở mức byte.
+
+Hai chuyện cần hai phản ứng khác nhau. Drift → đòi producer bump version.
+Không đọc được → báo sự cố truyền file, vào `quality.structural`.
+
+Dấu hiệu nhận biết: schema sniff được co lại còn **một cột mà tên chứa dấu phẩy
+hoặc dấu nháy**.
+
+Kết quả cuối: **68 green, 07-22 unreadable, 0 drift.**
+
+### Bắt được file đặt sai tên
+
+`era_by_header()` suy era từ header thật, tên file chỉ để đối chiếu. Thử với
+file v3 nhưng giả vờ tên ngày 07-20:
+
+```
+[warn] ngày nói v2 nhưng header nói v3 - file đặt sai tên? Đọc theo v3.
+('green', 'v3  shopcore_orders_daily.v3.contract.yaml')
+```
+
+Ngày trong tên file là **siêu dữ liệu**, header là **dữ liệu**. Mâu thuẫn thì
+tin cái quyết định việc đọc. Tin ngày thì `read_csv` dùng `V2_COLS` cho file v3
+— map theo vị trí, không lỗi, `'USD'` nằm trong `items`.
+
+### Check cross-field của A05
+
+Công thức thành `abs(total − (items_total − discount_amount)) > 0.01`, sửa đồng
+thời ở `a05_validate_day.flag_rows` và bản ghim trong `tests/test_checks.py`.
+Thêm hai case cho era v2 để ghim luật mới. 9 test xanh.
+
+> **Ranh giới cần biết cho A11.** `a05_validate_day.stage_day()` vẫn đọc CSV
+> bằng `V1_COLS` và giờ phát `discount_amount = 0` cứng. Với era v1 đó là GIÁ
+> TRỊ ĐÚNG (cùng lý lẽ `ALIGN['v1']`), nhưng nghĩa là **bộ check A05 hiện chỉ
+> chạy được cho file era v1**. `validate_day()` cũng luôn lấy contract 1.3.0.
+> Công thức đã viết sẵn dạng đầy đủ để lúc nối vào
+> `staging.shopcore_orders_canon` thì không phải sửa biểu thức nào. Việc nối đó
+> thuộc A11, cố ý không làm hôm nay.
+
+---
+
+## 9. Task 9 — giải thích lại
+
+**Cái nào breaking:** rename `payment_method`→`payment_type` (với một chương
+trình, đó là một cột biến mất và một cột lạ xuất hiện); `order_id` BIGINT→
+VARCHAR (hai dạng không bao giờ so bằng nhau); đổi thứ tự cột (mọi reader theo
+vị trí đọc sai); và — không có cột nào đổi — việc viết lại nghĩa `order_total`.
+
+**Cái nguy hiểm nhất dù trên giấy tờ không breaking:** `order_total` đổi nghĩa.
+Rename và đổi kiểu ít ra còn để lại dấu vết — cột thiếu, join không khớp, có
+thể phát hiện bằng cách đối chiếu schema. Còn `order_total` thì schema y
+nguyên, kiểu y nguyên, nullability y nguyên. Gate schema không có gì để bắt.
+Consumer nào đối chiếu theo công thức cũ vẫn chạy trơn, vẫn ra số, và báo lệch
+trên mọi đơn có discount — mà không có một dòng lỗi nào nói cho họ biết. Nó chỉ
+bị phát hiện khi ai đó thấy báo cáo tài chính lệch, có thể là vài tuần sau.
+
+Ứng viên thứ hai là đổi thứ tự cột: nạp `'USD'` vào `items` mà không báo lỗi.
+Nhưng cái đó ít ra sẽ lộ ở phép kiểm dữ liệu đầu tiên. Còn `order_total` lệch
+vài phần trăm thì trông y hệt rác cấp dòng vốn đã có sẵn.
+
+**Yêu cầu shopcore lần sau:** (1) một cột `schema_version` trong chính file —
+tự khai era thì consumer không phải đoán bằng header; (2) báo trước theo đúng
+`change_management`, 30 ngày cho MAJOR; (3) **coi việc đổi nghĩa một cột là
+MAJOR ngang với đổi kiểu** — điều khoản hiện tại chỉ liệt kê rename, xoá, đổi
+kiểu, nên shopcore có thể lập luận rằng thay đổi `order_total` không nằm trong
+danh sách. Đó là một khoảng trống cần vá.
+
+---
+
+## Observations to carry forward
+
+- **Drift hiếm khi tự xưng tên.** Nó hiện ra thành một lỗi khó hiểu, không phải
+  một lỗi trung thực. "Không dò được dialect" gần như không bao giờ nghĩa là
+  delimiter đổi — đếm số cột trước.
+- **Sáu trên bảy thay đổi của A10 là loại hỏng lặng.** Loại ồn ào là món quà.
+- **`columns=` map theo VỊ TRÍ, không theo tên.** Header chỉ bị bỏ qua. Viết
+  schema mới xong thì đọc thử một dòng và kiểm hai giá trị.
+- **`union_by_name` là công cụ thăm dò.** Nó giấu rename thành hai cột nửa NULL
+  và lặng lẽ đẩy khoá lên VARCHAR.
+- **Known value thì điền, unknown mới NULL.** `discount_amount = NULL` cho v1
+  phá phép đối chiếu; `channel = 'web'` thì bịa dữ liệu.
+- **Late correction vượt biên giới era.** Không có `order_id_num` thì mỗi dòng
+  sửa của v3 thành một đơn mới trong upsert — đếm trùng, không lỗi.
+- **`APPEND` cho ghi partition theo ngày**, không `OVERWRITE_OR_IGNORE`. Và
+  chấp nhận rằng script như vậy không chạy lại được: thư mục version mới là cơ
+  chế idempotent, không phải chính câu COPY.
+- **Kết quả đúng của bài trước có thể là tiền đề sai của bài sau** (§2).
+- **Ngày trong tên file là siêu dữ liệu; header là dữ liệu.** Mâu thuẫn thì tin
+  header, nhưng phải cảnh báo.
+- **Hai bản dựng lại độc lập ra cùng một con số là bằng chứng.** 803 dropped ở
+  small cộng từ 25 lần chạy riêng biệt; 99,4% reconciliation trùng khớp giữa ba
+  era và trùng với selftest đo theo đường khác.

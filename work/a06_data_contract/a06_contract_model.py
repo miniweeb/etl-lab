@@ -33,6 +33,7 @@ class Money(Clause):
     scale: int
     rounding: str
     negative_allowed: bool
+    transport_locale: dict[str, str] | None = None
     #   Sắc bén nhất trong cả model. Trong một dict thô, contract ghi
     #   negative_allowed: "false" sẽ trả về CHUỖI "false" — mà chuỗi rỗng-khác
     #   là TRUTHY trong Python: `if money["negative_allowed"]:` đọc thành "cho
@@ -54,6 +55,7 @@ class Column(Clause):
     warehouse_policy: str | None = None
     business_rule: str | None = None
     comment: str | None = None
+    semantics: str | None = None
 
 
 class Tolerances(Clause):
@@ -98,6 +100,7 @@ class Contract(Clause):
     version: str
     status: Literal["draft", "proposed", "agreed", "deprecated"]
     effective_from: date
+    supersedes: str | None = None
     delivery: Delivery
     late_corrections: LateCorrections
     columns: list[Column] = Field(alias="schema")

@@ -44,8 +44,22 @@ V2_COLS = dict(V1_COLS, **{'currency': 'VARCHAR',
 # thành payment_type, thêm loyalty_tier, và thứ tự cột khác v2.
 # Sau khi viết xong: đọc thử 1 dòng và spot-check 2 giá trị (items phải là JSON
 # mảng, currency phải là 'USD'/... chứ không phải một mảng).
-V3_COLS: dict[str, str] = {}
-
+V3_COLS: dict[str, str] = {
+    'order_id': 'VARCHAR',                 # v3 ép kiểu sang VARCHAR
+    'customer_id': 'BIGINT',
+    'store_id': 'INTEGER',
+    'order_ts': 'VARCHAR',
+    'updated_at': 'TIMESTAMP',
+    'status': 'VARCHAR',
+    'payment_type': 'VARCHAR',             # Đổi tên từ payment_method
+    'order_total': 'VARCHAR',
+    'currency': 'VARCHAR',                 # Đảo lên trước items, meta
+    'discount_amount': 'DECIMAL(14,2)',
+    'channel': 'VARCHAR',
+    'loyalty_tier': 'VARCHAR',             # Cột mới bổ sung ở v3
+    'items': 'VARCHAR',                    # Bị đẩy xuống áp chót
+    'meta': 'VARCHAR'                      # Bị đẩy xuống cuối cùng
+}
 
 # ── aligner: 15 cột giống hệt nhau cho mọi era ───────────────────────────────
 ALIGN = {
@@ -64,7 +78,17 @@ ALIGN = {
     # TODO(you) — Task 5. Bắt đầu từ v1, đúng BA dòng đổi:
     # currency / discount_amount / channel từ default thành pass-through.
     # loyalty_tier vẫn NULL (v2 chưa có). order_id vẫn phải printf.
-    "v2": """ ... """,
+    "v2": """SELECT
+    printf('ORD-%010d', order_id) AS order_id,
+    order_id                      AS order_id_num,
+    customer_id, store_id, order_ts, updated_at, status,
+    payment_method, order_total,
+    currency,                                      -- pass-through (v2 đã có sẵn)
+    discount_amount,                               -- pass-through (v2 đã có sẵn)
+    channel,                                       -- pass-through (v2 đã có sẵn)
+    CAST(NULL AS VARCHAR)         AS loyalty_tier, -- v2 chưa có -> giữ NULL
+    items, meta
+  FROM src""",
 
     "v3": """SELECT
     order_id,
