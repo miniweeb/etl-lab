@@ -78,6 +78,7 @@ def stage_day(con: duckdb.DuckDBPyConnection, day: str, scale: str) -> int:
         NULLIF(LOWER(TRIM(status)), '')                     AS status,
         NULLIF(LOWER(TRIM(payment_method)), '')             AS payment_method,
         {clean_money('order_total')}                        AS order_total,
+        CAST(0 AS DECIMAL(14,2))                            AS discount_amount,
         items,
         meta,
         DATE '{day}'                                        AS _data_date,
@@ -131,9 +132,15 @@ def flag_rows(con: duckdb.DuckDBPyConnection, day: str, scale: str) -> None:
                   THEN 'bad_payment' END,
              CASE WHEN s.order_total IS NULL THEN 'null_total' END,
              CASE WHEN s.order_total < 0 THEN 'negative_total' END,
-             -- cross-field, dung sai một xu; chặn >= 0 để total âm bị cờ MỘT lần
+                          -- cross-field, dung sai một xu; chặn >= 0 để total âm bị cờ MỘT lần.
+             -- 2.0.0 đổi NGHĨA của order_total: nó là tổng items TRỪ discount.
+             -- Ở đây discount_amount luôn bằng 0 vì stage_day đọc V1_COLS —
+             -- với era v1 đó là GIÁ TRỊ ĐÚNG, không phải giá trị tạm (cùng lý
+             -- lẽ với ALIGN['v1'] của A10). Viết công thức đầy đủ ngay từ giờ
+             -- để lúc A11 nối bộ check này vào staging.shopcore_orders_canon
+             -- thì không phải sửa lại biểu thức nào.
              CASE WHEN s.order_total >= 0 AND i.items_total IS NOT NULL
-                   AND abs(s.order_total - i.items_total) > 0.01
+                   AND abs(s.order_total - (i.items_total - s.discount_amount)) > 0.01
                   THEN 'total_mismatch' END,
              -- customer_id NULL là khách vãng lai: contract ghim nullable: true,
              -- nên đây là KHOẢNG TRỐNG, không phải vi phạm (A06 phân loại)

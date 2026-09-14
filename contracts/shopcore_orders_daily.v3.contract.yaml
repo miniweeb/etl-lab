@@ -1,0 +1,326 @@
+# ============================================================================
+# DATA CONTRACT — shopcore orders daily export
+#
+# This is the agreement between the producing application team and the data
+# warehouse team. It is a *promise*, version-controlled and reviewed like code.
+# The warehouse validates every delivery against it (A05/A06); anything the
+# data does that this file forbids is an INCIDENT to raise with the producer,
+# not something to silently "fix" in ETL.
+#
+# Read it the way a data engineer must: for every column ask —
+#   what type is it REALLY, can it be null, can it repeat, what timezone,
+#   what currency/scale, who owns the meaning, and WHAT IS NOT WRITTEN HERE?
+# ============================================================================
+
+contract: shopcore_orders_daily
+version: 3.0.0                # semver: MAJOR = breaking, MINOR = additive, PATCH = docs
+status: agreed                # draft -> proposed -> agreed -> deprecated
+supersedes: 2.0.0
+
+# ---------------------------------------------------------------------------
+# AMENDMENT 2.0.0 -> 3.0.0   (era v3, files dated 2026-08-01 onward)
+#
+# Breaking on four separate counts. Any ONE of them would have forced a MAJOR
+# bump; all four shipped together, unannounced, eleven working days after the
+# previous unannounced breaking change.
+#
+#   1. order_id BIGINT -> VARCHAR, format 'ORD-0000000123'   (BREAKING: type)
+#   2. payment_method RENAMED to payment_type                (BREAKING: rename)
+#   3. loyalty_tier appended                                 (additive)
+#   4. items[] gains a 'disc' field                          (nested additive)
+#   5. COLUMN ORDER changed — currency/discount_amount/
+#      channel/loyalty_tier now sit BEFORE items and meta    (BREAKING: order)
+#
+# Item 2 is the dangerous one and it is dangerous precisely because it is not
+# loud. A reader using union_by_name gets payment_method AND payment_type, each
+# half NULL, and raises nothing. Item 5 is the same shape of danger for any
+# reader that maps columns by position: it will load 'USD' into items without
+# a word of complaint.
+#
+# Item 1 breaks joins against history silently too. 'ORD-2070012345' never
+# equals 2070012345, so late corrections crossing the era boundary match
+# nothing — and an upsert then inserts them as brand-new orders. Measured on
+# the 08-01 file at small scale: 0 of 705 corrections matched on the raw id,
+# 705 of 705 matched once the id was canonicalized.
+# ---------------------------------------------------------------------------
+effective_from: "2026-08-01"   # era v3 starts here; 2.0.0 stays in force 07-16..07-31
+
+producer:
+  system: shopcore            # the e-commerce OLTP platform
+  dataset_owner: Checkout Platform team
+  contact: checkout-eng@shopcore.example
+  escalation: "#shopcore-oncall (24/7), then eng-manager on the team page"
+
+consumer:
+  system: analytics-warehouse
+  team: Data Engineering
+  contact: data-eng@shopcore.example
+  usage: >
+    Revenue reporting, ops dashboards, finance reconciliation. Finance-grade:
+    silent row loss or double counting is a sev-2.
+
+change_management:
+  notice_breaking: 30 days before any MAJOR change (column rename/removal/type change)
+  notice_additive: 7 days for new columns (consumer must tolerate unknown columns)
+  channel: "#shopcore-data-changes"
+  policy: >
+    Producer bumps MAJOR for breaking changes and ships a migration note.
+    Consumer pipelines must fail loudly (pre-load gate) on undeclared drift
+    rather than load garbage.
+
+# ---------------------------------------------------------------------------
+# Delivery & freshness
+# ---------------------------------------------------------------------------
+delivery:
+  method: daily file drop
+  path_pattern: "orders_YYYY-MM-DD.csv"
+  business_date: >
+    The date in the file name is the ORDER BUSINESS DATE in UTC. The file for
+    day D also carries corrections for orders up to 7 days old (see
+    late_corrections below) — consumers must not assume file date == every
+    row's order date.
+  format: CSV, UTF-8, header row, RFC 4180 quoting (JSON columns are quoted)
+  schedule: file complete by 02:00 UTC on D+1
+  freshness_sla: >
+    Warehouse load must be able to start by 04:00 UTC. A file missing at
+    04:00 UTC is a producer incident. A file dated more than 2 days ago that
+    suddenly changes is a restatement and must be announced — v1.3.0 has no
+    formal restatement clause; treat unannounced re-publishes as incidents.
+  completeness_signal: >
+    A manifest JSON (raw/manifest/orders_YYYY-MM-DD.json) is published with the
+    file: exact row count, byte size, min/max order_ts. The warehouse MUST
+    reconcile loaded rows against manifest.rows every load.
+  volume_expectation: >
+    0.8M-1.6M rows on weekdays, ~25% lower on weekends, up to 3x on promo days
+    (promo days are announced in #shopcore-data-changes). Loads outside
+    0.5x-4x of trailing-7-day median should alert.
+
+late_corrections:
+  window_days: 7
+  semantics: >
+    The same order_id may be re-sent in a later file (status progressed,
+    amount amended). LATEST updated_at WINS — latest by VALUE, not by
+    arrival order: a re-send may carry an updated_at older than the version
+    already delivered, and it must then lose the dedupe. Within one file
+    the same order_id may likewise repeat with a newer updated_at (an
+    in-file correction — the same latest-wins rule applies); byte-identical
+    exact re-sends may also appear (at-least-once delivery). The warehouse
+    is responsible for dedupe; the producer guarantees strictly increasing
+    updated_at only for corrections issued in the same file as the row they
+    amend — re-sends in later files promise no ordering at all.
+
+# ---------------------------------------------------------------------------
+# Schema — the promise, column by column
+# ---------------------------------------------------------------------------
+schema:
+  - name: order_id
+    type: VARCHAR               # CHANGED IN 3.0.0 — was BIGINT
+    nullable: false
+    shape: "'ORD-' followed by exactly 10 digits, zero-padded"
+    unique: >
+      Unique per real-world order, NOT unique per file (re-sends and late
+      corrections repeat it). Never reused, monotonically assigned per day.
+    comment: >
+      shopcore surrogate key; join key for all order-grain data. The type
+      change is breaking for every consumer holding history keyed on BIGINT:
+      the two forms never compare equal, and nothing raises. The warehouse
+      answers this by keeping both forms — order_id VARCHAR as delivered, plus
+      a derived order_id_num BIGINT for matching pre-3.0.0 history.
+
+  - name: customer_id
+    type: BIGINT
+    nullable: true              # guest checkout has no customer record
+    references: shopcore customers feed (customer_id)
+    comment: >
+      Null = guest checkout. Must exist in the customers dimension when
+      present; orphans indicate a sync gap and should be quarantined and
+      reported, not dropped.
+
+  - name: store_id
+    type: INTEGER
+    nullable: false
+    references: shopcore stores feed (store_id), values 1..400
+    comment: fulfilling store.
+
+  - name: order_ts
+    type: TIMESTAMP            # written as 'YYYY-MM-DD HH:MM:SS', no offset
+    timezone: >
+      UTC. The producer converts from store-local time BEFORE export and
+      handles DST; no timezone marker appears in the value.
+    warehouse_policy: >
+      Store raw as UTC (TIMESTAMP, no tz). Do NOT convert at ingest. Local
+      business time is derived only in marts, per store, via the stores
+      dimension (region), so one raw fact serves every regional report.
+    nullable: false
+    range: within [business_date - 7 days, business_date + 1 day)
+    comment: event time when the order was placed.
+
+  - name: updated_at
+    type: TIMESTAMP
+    timezone: UTC               # 2.0.0, folded in from the unsigned v1.4.0
+    semantics: event_time       # time the row changed at the source OLTP,
+                                # NOT the time the export job ran
+    nullable: false
+    comment: >
+      Last-change marker used for latest-wins dedupe. Guaranteed >= order_ts,
+      and strictly increasing only for in-file corrections; a re-send in a
+      later file may carry an OLDER updated_at than the version already
+      delivered — it then loses the dedupe (see late_corrections).
+      # NOTE the contract says nothing about this column's timezone or whether
+      # it is event time or export-batch time. That silence is load-bearing.
+
+  - name: status
+    type: VARCHAR
+    nullable: false
+    allowed_values: [created, paid, shipped, delivered, cancelled, refunded]
+    case: lowercase, no padding
+    comment: order lifecycle state at updated_at.
+
+  - name: payment_type        # RENAMED IN 3.0.0 — was payment_method
+    type: VARCHAR
+    nullable: false
+    allowed_values: [card, wallet, bank_transfer, cod, paypal]
+    case: lowercase, no padding
+    comment: >
+      Payment instrument chosen at checkout. Values and meaning are unchanged;
+      only the name moved. To a program that is not a rename, it is one column
+      disappearing and another appearing. A reader using union_by_name ends up
+      with both, each half NULL, and reports no error at all.
+
+  - name: order_total
+    type: DECIMAL(14,2)         # transported as a plain decimal string
+    money:
+      currency: USD             # see the currency column: USD is no longer the
+                                # only value carried, but it remains the unit
+                                # this contract prices and reconciles in
+      scale: 2
+      rounding: half-up, applied by producer
+      negative_allowed: false   # refunds arrive as status=refunded with a
+                                # POSITIVE amount; the sign is implied by status
+      transport_locale:         # 2.0.0, folded in from the unsigned v1.4.0
+        decimal_separator: "."
+        thousands_separator: none
+        currency_symbols: none
+    nullable: false
+    business_rule: >
+      CHANGED IN 2.0.0 — this is the breaking half of this amendment.
+      order_total == SUM(items[].qty * items[].unit_price) - discount_amount,
+      within +-0.01 (float transport tolerance). Under 1.3.0 there was no
+      discount term; a consumer that keeps the old formula now reports a gap on
+      every discounted order and no error anywhere tells it so. Any larger gap
+      is a producer bug: quarantine the row and report counts weekly.
+    comment: order grand total, net of discount.
+
+  # ---- 3.0.0 MOVED these BEFORE items/meta, and added loyalty_tier ---------
+  # The order below is the order in the file. It is not decoration: a reader
+  # using positional column mapping will load 'USD' into items if it trusts the
+  # 2.0.0 order, and DuckDB will not complain because both are VARCHAR-ish.
+  - name: currency
+    type: VARCHAR
+    nullable: false
+    allowed_values: [USD, EUR, GBP, VND]
+    case: uppercase, no padding
+    comment: >
+      ISO-4217 code of the amount in order_total. The v1 feed was USD-only by
+      contract; from 2026-07-16 the producer exports the transaction currency.
+      NOTE: order_total is NOT converted — a VND row carries a VND amount, so
+      any consumer that sums order_total across currencies is summing apples
+      and dong. No FX rate is supplied by this feed. Rows before the effective
+      date carry no value and the warehouse backfills 'USD', which is a known
+      value rather than a guess.
+
+  - name: discount_amount
+    type: DECIMAL(14,2)
+    nullable: false
+    money:
+      currency: USD
+      scale: 2
+      rounding: half-up, applied by producer
+      negative_allowed: false
+    comment: >
+      Order-level discount already subtracted from order_total. Zero when no
+      discount applied. Rows before the effective date carry no value and the
+      warehouse backfills 0 — known, not guessed, because no discount mechanism
+      existed. That backfill is what lets ONE reconciliation formula hold for
+      every era.
+
+  - name: channel
+    type: VARCHAR
+    nullable: true
+    allowed_values: [web, ios, android, partner]
+    case: lowercase, no padding
+    comment: >
+      Acquisition channel of the order. Nullable: the producer cannot always
+      attribute one. Rows before the effective date are genuinely unknown and
+      the warehouse backfills NULL — inventing 'web' here would be fabricating
+      data that no one measured.
+
+  - name: loyalty_tier
+    type: VARCHAR
+    nullable: true
+    allowed_values: [bronze, silver, gold, platinum]
+    case: lowercase, no padding
+    comment: >
+      Customer loyalty tier at order time. Nullable: guest checkouts and
+      non-enrolled customers have none. Rows before the effective date are
+      genuinely unknown and the warehouse backfills NULL.
+
+  - name: items
+    type: JSON                  # array of order lines, embedded as a string
+    nullable: false
+    shape: '[{"sku": string, "qty": number, "unit_price": number, "disc": number?}, ...]'
+    comment: >
+      1..N order lines. sku references the products feed. qty >= 1.
+      unit_price is the per-unit charge at purchase time, USD, scale 2.
+      ADDED IN 3.0.0: an optional per-line 'disc' field. Nested changes are the
+      quietest kind — nothing fails until code that parses this JSON meets the
+      new field, and a struct cast that omits it drops the value without a
+      word. Earlier eras cast cleanly into the wider struct with disc = NULL,
+      which is a nested backfill for free.
+      # NOTE: "number" here is not pinned to integer vs string-encoded, no
+      # max array length is declared, and null-representation conventions for
+      # optional keys are unstated. Silences worth noticing.
+
+  - name: meta
+    type: JSON
+    nullable: false
+    shape: '{"device": string, "utm": string?, "sess": string}'
+    comment: acquisition metadata; utm is optional.
+
+# ---------------------------------------------------------------------------
+# Quality gates the consumer runs (and the producer accepts as authoritative)
+# ---------------------------------------------------------------------------
+quality:
+  structural:
+    malformed_lines: 0 tolerated — a file with unparseable lines is a
+      producer incident; consumer loads clean rows, quarantines the rest,
+      and files the incident with reject counts.
+  reconciliation:
+    - loaded_rows == manifest.rows (hard fail otherwise)
+    - bytes on disk == manifest.bytes
+    - order_total == items_total - discount_amount, within +-0.01 (2.0.0)
+  row_level_tolerances:        # above these, the load hard-fails
+    null_or_invalid_status: 1%
+    unparseable_order_ts: 0.5%
+    unparseable_order_total: 1%
+    orphan_customer_id: 0.5%
+    orphan_sku_lines: 1%
+    total_vs_items_mismatch: 1%
+  duplicates:
+    within_file_exact_resends: 0.2% tolerated (at-least-once delivery)
+    # Byte-identical repeats only. A within-file repeat carrying a NEWER
+    # updated_at is an in-file correction (see late_corrections): latest-wins
+    # dedupes it and it does not count against this tolerance.
+    latest_wins_key: [order_id, updated_at]
+
+business_rules:
+  status_transitions: >
+    created -> paid -> shipped -> delivered; cancelled only from
+    created/paid; refunded only from paid/shipped/delivered. Late-correction
+    rows may only move status FORWARD.
+  refunds: status=refunded, positive order_total (see money.negative_allowed).
+  promo_days: volume spikes are legitimate; row-level rules unchanged.
+
+slo_reporting:
+  producer_receives: weekly quarantine/violation counts per rule
+  consumer_publishes: load status + freshness in ops dashboard (ops.etl_runs)

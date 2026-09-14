@@ -25,9 +25,15 @@ def con():
 
 # Biểu thức DƯỚI TEST — chép nguyên văn từ a05_validate_day.flag_rows.
 # (Ghim ở đây nghĩa là: sửa bên kia mà quên bên này thì test đỏ, đúng ý đồ.)
+# TOTAL_MISMATCH = """
+#     CASE WHEN total >= 0 AND items_total IS NOT NULL
+#           AND abs(total - items_total) > 0.01
+#          THEN 'total_mismatch' END
+# """
+
 TOTAL_MISMATCH = """
     CASE WHEN total >= 0 AND items_total IS NOT NULL
-          AND abs(total - items_total) > 0.01
+          AND abs(total - (items_total - discount_amount)) > 0.01
          THEN 'total_mismatch' END
 """
 
@@ -50,13 +56,24 @@ def run(con, expr, cols, cases):
 
 
 def test_total_mismatch(con):
-    # TODO(you): viết các case. Biên là điểm quan trọng nhất —
-    #   bằng nhau, lệch ĐÚNG 0.01 (biên PHẢI PASS), lệch 0.02 (fail),
-    #   items_total NULL (không phán xét), và total âm (đã bị
-    #   negative_total bắt rồi, không được bắt lần hai).
-    run(con, TOTAL_MISMATCH, ["total", "items_total"], [
-        ((Decimal("79.98"), 79.98), None),
-        # ...
+    # Biên là điểm quan trọng nhất — bằng nhau, lệch ĐÚNG 0.01 (biên PHẢI PASS),
+    # lệch 0.02 (fail), items_total NULL (không phán xét), và total âm (đã bị
+    # negative_total bắt rồi, không được bắt lần hai).
+    #
+    # Cột thứ ba là discount_amount. Contract 2.0.0 đổi nghĩa của order_total
+    # thành "tổng items TRỪ discount", nên mọi case phải nói rõ discount bằng
+    # bao nhiêu, kể cả khi bằng 0.
+    run(con, TOTAL_MISMATCH, ["total", "items_total", "discount_amount"], [
+        # era v1: discount luôn 0, công thức thu về phép so cũ
+        ((Decimal("79.98"), 79.98, Decimal("0")), None),
+        ((Decimal("79.99"), 79.98, Decimal("0")), None),
+        ((Decimal("80.00"), 79.98, Decimal("0")), 'total_mismatch'),
+        ((Decimal("79.98"), None, Decimal("0")), None),
+        ((Decimal("-5.00"), 79.98, Decimal("0")), None),
+
+        # era v2+: discount khác 0
+        ((Decimal("69.98"), 79.98, Decimal("10.00")), None),
+        ((Decimal("79.98"), 79.98, Decimal("10.00")), 'total_mismatch'),
     ])
 
 
