@@ -1626,3 +1626,413 @@ danh sách. Đó là một khoảng trống cần vá.
 - **Hai bản dựng lại độc lập ra cùng một con số là bằng chứng.** 803 dropped ở
   small cộng từ 25 lần chạy riêng biệt; 99,4% reconciliation trùng khớp giữa ba
   era và trùng với selftest đo theo đường khác.
+
+---
+
+# A11 — Backfill: replay 69 ngày, và cái ngày hỏng
+
+Nạp lại toàn bộ lịch sử vào `core.orders` bằng chính pipeline hằng ngày. Một
+ngày trong đó có file hỏng — phát hiện, chẩn đoán theo lớp, vá, chạy lại đúng
+ngày đó. Rồi đo xem tuần tự chậm đến mức nào, vì A12 phải đánh bại con số đó.
+
+---
+
+## 1. Đã làm gì
+
+| Task | Việc | Kết quả |
+|---|---|---|
+| 1 | Đọc manifest trước khi chạy | 69 file, 4.116.840 dòng, **151 dòng hỏng ở 07-22** |
+| 2 | `work/pipeline.py` + `work/runner.py` | smoke test khớp manifest |
+| 3 | Backfill lần đầu, small | 68 success, 1 failed, 86,4 s |
+| 4 | Chẩn đoán 07-22 theo lớp | 150 dòng cắt + 1 nháy không đóng |
+| 5 | Vá, cách ly, chạy lại | 1/69 ngày, xanh trong 0,9 s |
+| 6 | Full scale | 69/69, 82.337.467 dòng, **1.004,9 s** |
+| 7 | Freshness gate + bằng chứng ledger | xanh/đỏ đúng, 3 query lưu lại |
+| 8 | Toán chi phí | ngoại suy giữa hai scale lệch 73% |
+| 9 | Postmortem | `work/incidents/2026-07-22_corrupt_export.md` |
+
+Code mới: `work/pipeline.py`, `work/runner.py`,
+`work/a11_backfill/a11_freshness_gate.py`, `work/a11_backfill/a11_explore.py`.
+
+---
+
+## 2. Backfill không phải một script riêng
+
+Nó là pipeline hằng ngày, chạy lại trên nhiều ngày quá khứ. Viết một "bản
+backfill" riêng của cùng logic là tạo ra hai pipeline rồi để chúng trôi xa nhau
+— và bản backfill là bản ít được chạy hơn, tức ít được kiểm hơn.
+
+A07 đã làm phần khó: mỗi ngày nạp lại bao nhiêu lần cũng ra một kết quả. A11
+chỉ thêm một vòng lặp mỏng quanh nó.
+
+Bốn việc của runner: lập kế hoạch trước khi động tay (`--dry-run`), nhớ đã làm
+gì (đọc `ops.etl_runs`), gặp lỗi thì đi tiếp, và ước lượng chi phí.
+
+### Ghép A07 với A10: năm chỗ đổi
+
+| A07 | A11 | Vì sao |
+|---|---|---|
+| `load_day(con, scale, day, chaos)` | `load_day(con, day, scale, run_id)` | runner truyền `run_id` xuống để đóng dấu `_run_id` |
+| tự mở ledger bằng `open_run()` | **không đụng ledger** | runner sở hữu vòng đời lần chạy |
+| `UPDATE` ledger trong transaction | runner update sau khi hàm trả về | xem §3 |
+| `all_varchar=true`, một schema v1 | `columns=era_columns(d)` | v3 đổi thứ tự cột, đoán là đoán sai |
+| cleaner viết thẳng trong SQL | `CANON` của A10 | một bản, dùng cho cả migrate lẫn load |
+
+**Bảng `core.orders` cũ phải DROP.** Nó còn hình dạng v1 13 cột của A07;
+`CREATE TABLE IF NOT EXISTS` thấy nó và bỏ qua, rồi ngày đầu chết với
+`Binder Error: 13 columns but 18 values`. Là dữ liệu dẫn xuất — raw + code dựng
+lại được.
+
+**Không gọi `open_day()` của A10 trong `load_day`.** Hàm đó tự chạy `read_csv`
+lần nữa, và lần đó không có `store_rejects` — 07-22 sẽ lại chết. `src` phải trỏ
+vào bảng đã đọc xong; `aligned` vẫn dùng nguyên `ALIGN[era]`.
+
+**`load_day` chỉ ghi warehouse core, KHÔNG ghi lake.** Lake dùng
+`COPY ... APPEND`, mà `APPEND` không idempotent: replay 69 ngày qua đó sẽ nhân
+đôi 68 ngày A10 đã ghi, lặng lẽ, và không phép kiểm nào trước A15 bắt được.
+Lake thiếu đúng một ngày và được vá tay một lần.
+
+---
+
+## 3. Ledger đổi chủ — và cái giá của nó
+
+A07 cố ý đặt `UPDATE ops.etl_runs` **bên trong** `BEGIN...COMMIT`, để ledger
+không bao giờ khai thành công cho dữ liệu không tồn tại. A11 tách ra: runner
+update sau khi `load_day` trả về.
+
+Đó là một bước lùi nhỏ về tính đúng. Chết đúng giữa `COMMIT` và `UPDATE` thì dữ
+liệu đã vào mà ledger còn `running`. Đổi lại, vòng đời lần chạy nằm gọn ở một
+nơi, và gọi `load_day` trực tiếp không sinh rác ledger.
+
+Khe đó tự lành: resume mặc định chạy lại **mọi ngày không xanh**, kể cả
+`running`. Nhưng `--only-failed` thì **không** — nó lọc đúng cái tên nó nói.
+Ctrl-C giữa chừng để lại một dòng `running`, và chỉ resume mặc định nhặt nó lên.
+
+### Ba chế độ
+
+| Chế độ | Chọn gì | Dùng khi |
+|---|---|---|
+| mặc định | bỏ ngày xanh, chạy mọi thứ còn lại | resume sau khi crash |
+| `--only-failed` | chỉ ngày có lần cuối `failed` | sửa xong một sự cố |
+| `--force` | tất cả, kể cả ngày xanh | restatement |
+
+---
+
+## 4. Va phải một sự cố có thật: sequence vs max()+1
+
+Lần chạy đầu chết ngay dòng INSERT ledger:
+
+```
+ConstraintException: Duplicate key "run_id: 62" violates primary key constraint
+```
+
+Hai bộ cấp phát `run_id` cùng chạy trên một bảng. A07 và runner dùng
+`nextval('ops.run_id_seq')`; **`RunLog._next_id()` của A10 dùng
+`SELECT max(run_id) + 1`**, bỏ qua sequence hoàn toàn. 50 dòng A10 ghi vào đã
+đẩy `max` lên 111 trong khi sequence vẫn đứng ở 62.
+
+Khoá chính bắt được ngay — đúng việc của nó. Không có nó thì hai lần chạy khác
+nhau mang cùng một id, và `_run_id` trên dữ liệu trỏ nhập nhằng.
+
+Sửa: `DROP SEQUENCE` rồi `CREATE SEQUENCE ... START max+1`, cho cả hai scale
+(small 112, full 34).
+
+**`max()+1` còn sai nặng hơn trong môi trường nhiều process**: hai process đọc
+cùng một `max` rồi ghi cùng một id. A12 chạy song song, nên chỗ này sẽ quan
+trọng.
+
+---
+
+## 5. Chẩn đoán theo lớp, không theo cảm hứng
+
+### Rule zero: đọc lỗi, chép vào journal, rồi từ chối tin nó
+
+```
+Invalid Input Error: Error when sniffing file ".../orders_2026-07-22.csv".
+It was not possible to automatically detect the CSV parsing dialect
+```
+
+Dialect **không hề đổi**. Thông báo lỗi trỏ vào triệu chứng gần chỗ code ném
+lỗi nhất, không phải nguyên nhân gốc.
+
+### Lớp 1 và 2 — gạch bỏ bằng bằng chứng, không bằng cảm giác
+
+Preflight vừa chạy **xanh cả bảy check cho đúng ngày này** vài giây trước khi
+chết. Môi trường, ổ đĩa, quyền, khoá warehouse — loại hết trong một nốt nhạc.
+
+Đó là phần thưởng của việc gọi preflight **trước mỗi ngày** thay vì một lần lúc
+khởi động. Bảy dòng PASS lặp lại 69 lần trông rườm rà cho tới đúng lúc này.
+
+### Lớp 3 — dữ liệu
+
+| Câu hỏi | Trả lời |
+|---|---|
+| File có tồn tại? | có, 18,9 MB — nằm giữa hàng xóm (18,9 / 19,9 / 19,8) |
+| Header nguyên? | nguyên, 13 cột v2 đúng thứ tự |
+| Dòng đầu? | bình thường, dấu phẩy và nháy kép chuẩn |
+| Manifest nói gì? | `corrupt_rows: 151` |
+
+→ hỏng **cấu trúc ở mức dòng**. Đúng tình huống dùng `store_rejects=true`.
+
+### Bệnh
+
+| error_type | records | dòng |
+|---|---|---|
+| MISSING COLUMNS | 1.500 | 150 |
+| CAST | 150 | 150 |
+| UNQUOTED VALUE | 1 | 1 |
+
+- **150 dòng bị cắt giữa chừng.** 1.500 ÷ 150 = đúng 10 cột thiếu mỗi dòng, cắt
+  sau cột thứ ba. `CAST` là hệ quả kèm theo — mẩu sót lại không ép được kiểu.
+- **1 dòng nháy không đóng** — và đây là mắt xích: nó đầu độc bộ dò dialect của
+  **cả file**. Sniffer đọc mẫu, gặp nháy mở không bao giờ đóng, mọi tổ hợp
+  delimiter/quote đều không giải thích nổi phần còn lại.
+
+**Bệnh là 150 dòng bị cắt lúc shopcore xuất file; triệu chứng là sniffer bó
+tay.**
+
+Hai chỗ dễ sai khi dùng `store_rejects`:
+
+- Phải `CREATE TABLE ... AS`. Một `count(*)` trần bị tối ưu bỏ qua khâu parse,
+  bảng reject rỗng, và ta kết luận file không sao.
+- Đếm `DISTINCT line`, không đếm bản ghi. Một dòng cắt sinh **một bản ghi cho
+  mỗi cột thiếu**: 1.651 bản ghi nhưng chỉ 151 dòng.
+
+---
+
+## 6. Vá: đọc khoan dung, giữ bằng chứng, đối soát
+
+Ba mảnh ghép vào `load_day`.
+
+**`store_rejects=true`** — parse được dòng nào giữ dòng đó, dòng hỏng đẩy sang
+`reject_errors` thay vì giết cả file.
+
+**Quarantine** — copy sang parquet kèm `_data_date`, `_run_id`, `_rejected_at`.
+Rồi **`DELETE FROM reject_errors`**: bảng đó cộng dồn theo connection, không xoá
+thì ngày N+1 copy lại cả reject của ngày N và mọi file quarantine sau đó đều
+phình lên, âm thầm sai.
+
+**Reconciliation guard** — so số dòng đọc được với `manifest.rows`, **trên bảng
+raw, không phải sau CANON**. CANON bỏ các dòng timestamp không parse nổi nên
+bảng sau nó luôn nhỏ hơn manifest vài chục dòng; so sai bảng thì mọi ngày đều
+đỏ oan.
+
+Với 07-22: manifest khai 58.400, đọc được đúng 58.400. **151 dòng hỏng nằm
+NGOÀI con số producer khai**, nên phép cộng đóng. Nếu shopcore đã tính chúng vào
+`rows` thì guard sẽ đỏ — và đó mới là sự cố khác.
+
+**File raw không sửa một byte.** Raw là bằng chứng bất biến, và generator cũng
+sẽ tạo lại y hệt. Cái đổi là *cách đọc*.
+
+### Kết quả
+
+```
+--only-failed  ->  1 trên 69 ngày được chọn
+2026-07-22  OK  58,400 dòng  0.9 s
+success  69  4116840
+```
+
+0,9 giây để sửa một ngày, so với 86 giây chạy lại cả 69. Đó là giá trị cụ thể
+của ledger.
+
+Quarantine truy vết được về đúng lần chạy đã gặp nó:
+
+```
+orders_2026-07-22.csv | 2026-09-15 14:04:04 | success | 58400 | 151
+```
+
+Một phép join giữa parquet và `ops.etl_runs` trên `_run_id`. Parquet **không**
+lưu tên file và không cần: `_run_id` dẫn tới ledger, và ledger có tên file.
+
+### Vá lake, một lần, bằng tay
+
+| | trước | sau | thêm |
+|---|---|---|---|
+| small | 4.057.637 | **4.116.024** | 58.387 = 58.400 − 13 |
+| full | 81.153.228 | **82.320.994** | 1.167.766 = 1.168.003 − 237 |
+
+Cả hai vẫn 69 partition.
+
+**Bẫy suýt dính:** `staging.shopcore_orders_day_raw` bị ghi đè mỗi ngày. Sau
+lần chạy full, nó đang giữ **08-08**, không phải 07-22 — COPY lúc đó sẽ ghi
+nhầm ngày vào lake, và `APPEND` thì không hoàn tác được. Phải
+`--force` nạp lại đúng 07-22 trước, và thêm một `assert` kiểm `_data_date`
+trước khi ghi.
+
+---
+
+## 7. Freshness gate: người canh chạy theo đồng hồ
+
+**Runner chỉ nhận ra file thiếu nếu có ai đó chạy nó.** Một chuyến giao không
+bao giờ đến thì không gây lỗi ở đâu cả, vì công việc lẽ ra phải thất bại đã
+không bao giờ khởi động. SLA cần watchdog chạy theo đồng hồ, không theo yêu cầu.
+
+Phân công với A05: `a05_freshness_check.py` dò `max(_data_date)` của
+`core.orders` — nhìn warehouse từ **bên trong**, hỏi "kho có cũ không".
+`a11_freshness_gate.py` nhìn thư mục giao của shopcore từ **bên ngoài**, hỏi
+"nguồn có giao không". Hai cảm biến, cùng đổ về `ops.alerts`.
+
+Đáng giữ phân biệt đó: kho cũ có thể vì nguồn không giao, mà cũng có thể vì
+pipeline chết — hai nguyên nhân, hai người phải gọi.
+
+`due_through()` tồn tại thay vì viết thẳng `today - 1` vì **cùng một ngày lịch
+cho hai câu trả lời khác nhau tuỳ giờ**. File của D đến hạn vào D+1 lúc 04:00
+UTC; chạy lúc 03:00 mà báo động thì sẽ bị tắt chuông trong một tuần.
+
+Demo, không đụng file nào — chuyến giao cuối là 08-08 nên đẩy đồng hồ thêm một
+ngày chính là ngày thiếu:
+
+```
+--as-of 2026-08-09T04:30  ->  fresh - mọi file tới 2026-08-08 đã được giao
+--as-of 2026-08-10T04:30  ->  ALERT freshness  orders_2026-08-09.csv missing
+                              exit code 1, một dòng ops.alerts, run_id NULL
+```
+
+`run_id` NULL **chính là điểm mấu chốt**: mọi alert khác sinh ra từ một run
+đang chạy; alert này sinh ra từ một run không bao giờ xảy ra.
+
+Ba tầng phải cùng nói một điều: console, `ops.alerts`, và **mã thoát**. In màn
+hình đỏ mà vẫn `exit 0` là chuông báo cháy không lắp pin.
+
+**Một lỗi cũ phát hiện được nhân tiện:** `write_alert` của A07 dùng tên cột
+nhưng bỏ sót `source`, nên 5 alert của nó đều `source = NULL`. Lọc theo `source`
+sẽ bỏ sót chúng. Chưa sửa.
+
+---
+
+## 8. Ledger là bằng chứng
+
+Ba query, ba câu hỏi của postmortem.
+
+**Khi nào biết** — số lần thử mỗi ngày: đúng một dòng, `2026-07-22 | 2 | 1`.
+Không ngày nào khác cần thử lần hai. Dấu vân tay của sự cố cục bộ.
+
+**Mất bao lâu để sửa** — dòng thời gian: `failed` 10:57:10 (114 ms) →
+`success` 14:04:05 (0,9 s). **Thời gian phát hiện gần bằng 0; thời gian sửa là
+3 giờ**, và gần hết trong đó là chẩn đoán với viết code.
+
+Lần thử hỏng có `rows = NULL`, không phải 0. Đúng — 0 là một lời khẳng định,
+NULL là sự thật: lần đó chưa đếm được gì.
+
+**Lan tới đâu** — biểu đồ dòng theo ngày: cao nguyên 57–62k, hõm cuối tuần
+43–47k, hai cột gấp ba ở 06-19 và 07-11, không hố nào, không cột lạ nào. Sự cố
+chạm đúng một ngày.
+
+Toàn bộ đọc từ **69 dòng ledger**, không phải 4 triệu dòng dữ liệu. Và
+`source_file` ghi ở lệnh `INSERT` chứ không phải `UPDATE` — một ngày thất bại
+vẫn phải nói được nó nghẹn ở file nào.
+
+---
+
+## 9. Toán chi phí: ngoại suy giữa hai scale thì sai
+
+| | small | full | tỉ lệ |
+|---|---|---|---|
+| dòng | 4.116.840 | 82.337.467 | 20,0× |
+| wall clock | 86,4 s | **1.004,9 s** | 11,6× |
+| dòng/giây | 47.354 | 81.960 | 1,7× |
+
+**1.004,9 giây là baseline chính thức cho A12.** Phải xuống dưới 335 giây.
+
+Ngoại suy: 82.337.467 ÷ 47.354 = **1.739 s**. Thực tế **1.005 s**. Dự đoán sai
+73%, và sai theo hướng *quá bi quan*.
+
+Ba lý do:
+
+1. **Chi phí cố định mỗi ngày không co giãn.** Preflight bảy check, mở
+   connection, `CREATE TABLE IF NOT EXISTS`, `BEGIN/COMMIT` — cùng một khoản ở
+   cả hai scale, cùng 69 ngày, nhưng ở small nó chia cho 60k dòng còn ở full
+   chia cho 1,2 triệu.
+2. **File lớn stream hiệu quả hơn.** DuckDB đọc theo vector, 8 luồng. File 18 MB
+   không đủ việc để 8 luồng bận; file 360 MB thì có.
+3. **Hai ngày cao điểm kéo trung bình LÊN, không kéo xuống.**
+
+Bảng năm ngày chậm nhất ở full cho thấy nghịch lý đó rõ nhất:
+
+| ngày | dòng | giây | dòng/giây |
+|---|---|---|---|
+| 06-19 | 3.643.024 | 41,2 | **88.455** |
+| 07-11 | 3.602.310 | 34,0 | **106.031** |
+| 08-05 | 1.140.990 | 24,3 | 47.001 |
+| 08-06 | 1.222.852 | 22,9 | 53.458 |
+| 08-07 | 1.251.587 | 22,4 | 55.924 |
+
+Ngày cao điểm chạy **nhanh hơn** ngày thường tính trên mỗi dòng, dù tốn nhiều
+thời gian tuyệt đối hơn.
+
+Ước lượng chi phí cố định: nếu 106.000 dòng/giây là tốc độ thật khi đã chạy,
+82,3 triệu dòng cần ~780 s làm việc thật. 1.005 − 780 ≈ **225 s chi phí cố
+định**, tức 22% tổng thời gian, ≈ 3,3 s mỗi ngày.
+
+**Đó chính là chỗ A12 nhắm vào.** Chạy 4 ngày song song không làm SQL nhanh
+hơn, nhưng 225 giây đó bị chia ra. Và 14,6 s/ngày trên máy 8 luồng mà CPU không
+chạm trần nghĩa là phần lớn thời gian máy đang rảnh.
+
+**Luật rút ra: ngoại suy trong cùng scale, đừng ngoại suy giữa hai scale.** Ở
+production thật, người ta chạy một chunk nhỏ **trong đúng môi trường đích** rồi
+mới ngoại suy, không đo trên máy dev.
+
+---
+
+## 10. Ba câu về phép lịch sự khi backfill
+
+**Chunking — vì sao chia 69 ngày thành 10 chunk tuần thay vì chạy một phát.**
+Ba lý do, và không lý do nào là tốc độ. Thứ nhất, bán kính của một lần hỏng:
+chạy một phát mà sai logic ở ngày thứ 40 thì 40 ngày phải làm lại; chia chunk
+thì mất nhiều nhất một tuần. Thứ hai, áp lực đĩa và `tmp` — spill dồn lại trong
+một lần chạy dài, chia chunk cho ổ đĩa thở giữa các đợt. Thứ ba, và đây mới là
+lý do thật: sau chunk đầu tiên **có cơ hội nhìn kết quả bằng mắt** trước khi
+đốt thêm ba tiếng. Một `SELECT count(*) GROUP BY order_date` sau tuần đầu bắt
+được lỗi mà không phép kiểm tự động nào nghĩ tới. Cái giá phải trả là 10 lần
+gõ lệnh thay vì 1, và ledger làm cho chuyện đó không tốn gì — mỗi chunk tự biết
+nó nối tiếp từ đâu.
+
+**Marts dẫn xuất — backfill xong rồi chúng có tự đúng không.** Không. `core.orders`
+vừa nhận thêm 69 ngày, nhưng mọi bảng dẫn xuất từ nó vẫn giữ kết quả tính từ
+dữ liệu cũ. Chúng không sai một cách ồn ào — chúng vẫn chạy, vẫn trả về số, và
+số đó thiếu 69 ngày. Đây đúng là kiểu hỏng lặng đã gặp ở A10 với `order_total`.
+Nên backfill chưa xong khi `core.orders` xanh; nó xong khi mọi thứ đọc từ
+`core.orders` đã được dựng lại. Thứ tự bắt buộc là từ dưới lên: core trước, rồi
+mart tầng một, rồi mart tầng hai. Dựng mart trước khi core xong thì mart đóng
+băng một trạng thái nửa vời. Và nếu mart dựng theo kiểu incremental thì phải
+biết ngày nào đã đổi — đó lại là `ops.etl_runs`.
+
+**Thông báo — backfill trên hệ thống dùng chung.** Trước khi chạy, nói cho
+người dùng warehouse biết ba điều: chạy lúc nào, đụng vào bảng nào, và trong
+lúc đó số liệu sẽ trông thế nào. Điều thứ ba là điều hay bị bỏ quên và là điều
+gây hoảng nhất: một dashboard đọc `core.orders` giữa chừng backfill sẽ thấy dữ
+liệu tăng dần theo từng ngày được nạp — không sai, nhưng trông như đang có
+chuyện. Nếu không muốn ai thấy trạng thái nửa vời thì phải nạp vào bảng khác
+rồi đổi tên một lần, đúng cách A09 làm với partition. Sau khi chạy, báo lại
+kết quả: bao nhiêu ngày, bao nhiêu dòng, có ngày nào cần chú ý không. Im lặng
+trước và sau đều đắt hơn một tin nhắn.
+
+---
+
+## Observations to carry forward
+
+- **Backfill là pipeline hằng ngày chạy lại, không phải script riêng.** Hai bản
+  của cùng một logic sẽ trôi xa nhau, và bản ít chạy hơn là bản ít được kiểm hơn.
+- **Preflight gọi trước MỖI ngày, không một lần lúc khởi động.** Giá trị của nó
+  hiện ra đúng lúc có sự cố: gạch hai lớp chẩn đoán bằng bằng chứng.
+- **`APPEND` không idempotent.** Mọi script dùng nó đều không chạy lại được. Cơ
+  chế idempotent phải nằm ở tầng khác (thư mục version mới, hoặc DELETE trước).
+- **Bảng staging bị ghi đè mỗi ngày.** Trước khi COPY từ nó, kiểm `_data_date`
+  bằng `assert`. `APPEND` không hoàn tác được.
+- **`reject_errors` cộng dồn theo connection.** Không `DELETE` thì ngày sau
+  copy lại reject của ngày trước.
+- **Đếm `DISTINCT line`, không đếm bản ghi reject.** Một dòng cắt sinh một bản
+  ghi cho mỗi cột thiếu.
+- **`store_rejects` cần `CREATE TABLE ... AS`.** `count(*)` trần bị tối ưu bỏ
+  qua khâu parse và bảng reject sẽ rỗng.
+- **Đối soát trên bảng RAW, trước khi làm sạch.** Sau khi làm sạch thì số luôn
+  nhỏ hơn manifest và mọi ngày đỏ oan.
+- **Sequence và `max()+1` không dùng chung được** trên một bảng. `max()+1` còn
+  sai nặng khi nhiều process — A12 sẽ đụng.
+- **`rows = NULL` khác `rows = 0`.** 0 là khẳng định; NULL là chưa đếm được.
+- **Thông báo lỗi trỏ vào triệu chứng gần chỗ ném lỗi nhất**, không phải nguyên
+  nhân gốc. Chép lại, rồi từ chối tin nó.
+- **Tín hiệu có sẵn mà không ai đọc thì bằng không có.** `corrupt_rows: 151`
+  nằm trong manifest suốt từ A10.
+- **Ngoại suy trong cùng scale.** Chi phí cố định mỗi ngày không co giãn theo
+  dữ liệu, nên tỉ lệ dòng/giây của small không nói được gì về full.
