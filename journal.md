@@ -2036,3 +2036,290 @@ trước và sau đều đắt hơn một tin nhắn.
   nằm trong manifest suốt từ A10.
 - **Ngoại suy trong cùng scale.** Chi phí cố định mỗi ngày không co giãn theo
   dữ liệu, nên tỉ lệ dòng/giây của small không nói được gì về full.
+
+# A12 — Parallelization
+
+Máy: 8 core, 16 GB RAM. Dữ liệu ở `D:\etl_lab`. Nhánh `a12-parallelization`.
+
+---
+
+## Task 1 — Ngân sách trên giấy
+
+Hai bất đẳng thức, và không có gì trong DuckDB hay `multiprocessing` kiểm hộ cả.
+`memory_limit` là giới hạn **của từng process**; tổng là việc của mình.
+
+```
+workers × threads          ≤ 8 core
+workers × mem + 4GB (OS)   ≤ 16 GB
+```
+
+| cfg | mem/worker | thread | RAM hứa | hợp lệ |
+|---|---|---|---|---|
+| 1×8 | 8 GB | 8 | 8 GB | có |
+| 2×4 | 5 GB | 8 | 10 GB | có |
+| 4×2 | 3 GB | 8 | 12 GB | có |
+| 8×1 | 1,5 GB | 8 | 12 GB | có |
+| 8×8 | 1,5 GB | **64** | 12 GB | không — vi phạm core |
+| 8×1 | 12,8 GB | 8 | **102 GB** | không — vi phạm RAM |
+
+Hai dòng cuối sai theo hai kiểu khác nhau: một cái đốt core vào context switch,
+một cái hứa RAM không tồn tại.
+
+---
+
+## Task 2 — Một writer, và chỉ một
+
+Terminal 1 giữ `warehouse.duckdb`, terminal 2 xin vào → `IOException`.
+Thử lại với `read_only=True` → **cũng hỏng**.
+
+Đó mới là phần đáng nhớ. Luật không phải "một writer, nhiều reader" mà là
+**writer giữ file thì không ai vào**.
+
+Hệ quả cho cả bài: worker không thể ghi warehouse, kể cả chỉ đọc một thứ nhỏ.
+Nên kiến trúc chỉ còn một hình dạng khả dĩ — worker viết parquet ra file riêng,
+một committer gom lại. Đó không phải lựa chọn phong cách, đó là thứ duy nhất
+chạy được.
+
+---
+
+## Task 3 — Pool, small scale
+
+Chạy thử month 1 (45 ngày v1), 4×2, mem 3 GB: **13,1 s**, peak RSS 0,4 GB,
+staged 2.773.013 dòng.
+
+Thứ tự ngày in ra không theo lịch — dấu hiệu `imap_unordered` đang chạy song
+song thật.
+
+Cả 69 ngày: staged **4.116.024**, manifest 4.116.840, dropped **816**.
+816 dòng bị bỏ là các dòng timestamp không parse nổi mà `CANON` vứt — nhiều hơn
+803 của A10 đúng 13, vì lần này 07-22 cũng được stage (`store_rejects=true`) và
+13 dòng của nó nhập vào tổng.
+
+---
+
+## Task 4 — Committer, và phát hiện thật của hôm nay
+
+```
+staged rows      : 4,116,024
+core.orders_par  : 4,053,208
+_data_date       : 69 / 0 NULL
+commit wall      : 19,0 s
+```
+
+| pha | wall |
+|---|---|
+| stage (4 worker, 69 ngày) | 20,8 s |
+| commit (1 process) | **19,0 s** |
+| tổng | 39,8 s |
+
+**Committer chiếm gần một nửa và hoàn toàn tuần tự.** Tôi vừa song song hoá cái
+pha mà giờ chỉ còn là một nửa bài toán — định luật Amdahl đập vào mặt ngay lần
+chạy đầu. Thêm worker vào stage sẽ không bao giờ đưa tổng xuống dưới 19 s.
+
+Điều này quyết định cách đọc Task 5: bảng thực nghiệm **chỉ đo pha stage**.
+8 worker kéo stage xuống 12 s trông như thắng lớn, nhưng tổng chỉ từ 39,8 còn 31.
+
+`4.053.208` thấp hơn `expected_unique` (4.054.002) đúng **794**: với 794 order,
+bản duy nhất của nó lại chính là dòng timestamp hỏng đã bị vứt. Mất hẳn order,
+không phải mất một bản sao. Đếm và giải thích, không ép cho bằng.
+
+---
+
+## Task 5 — Bảng thực nghiệm (small, 69 ngày)
+
+| cfg | mem | wall | peak RSS | speedup |
+|---|---|---|---|---|
+| 1×8 | 8 GB | 28,8 s | 0,2 GB | 1,00× |
+| 2×4 | 5 GB | 26,3 s | 0,3 GB | 1,09× |
+| **4×2** | **3 GB** | **16,0 s** | 0,5 GB | **1,80×** |
+| 8×1 | 1500 MB | 17,6 s | 0,7 GB | 1,64× |
+
+Baseline là **1×8**, không phải 1×1: A11 đã dùng cả 8 core bên trong mỗi query
+rồi, so với 1×1 là tự tâng bốc.
+
+Ba điều đọc ra:
+
+- **8×1 thua 4×2.** Mỗi worker 1 luồng là mất hẳn phần song song *bên trong* mỗi
+  query; phần thêm được từ nhiều process không bù nổi.
+- **RSS tăng đều theo số process** (0,2 → 0,7 GB). Mỗi process trả một khoản cố
+  định cho Python + DuckDB runtime, bất kể nó làm gì.
+- **Đường cong 1,00 → 1,09 → 1,80 → 1,64 có đỉnh.** Lợi ích không tuyến tính.
+
+Chọn **4×2, mem 3 GB**.
+
+---
+
+## Task 6 — Hai lần phá hoại có kiểm soát (full, 7 ngày 06-15→06-21)
+
+Mốc so: 4×2 hợp lệ → **35,3 s**, peak RSS 1,0 GB.
+
+### 6.1 Oversubscription — 8×8 (64 thread trên 8 core)
+
+**56,8 s, peak RSS 4,0 GB. Chậm hơn 61%** — không phải "không nhanh hơn" mà tệ
+hơn hẳn.
+
+Chi tiết đáng giá nhất nằm ở cột giây từng ngày, không phải ở wall. Ở 8×8 **mọi
+ngày thường đều mất ~43,8 s** — kể cả ngày nhỏ nhất (864k dòng) lẫn ngày to gấp
+rưỡi (1,2 triệu). Ở 4×2 chúng chênh rõ: 8,1 s đến 17,0 s.
+
+Nghĩa là khi 64 luồng tranh 8 core, **thời gian một ngày không còn phụ thuộc vào
+ngày đó nữa** — nó bằng thời gian cả lô chia đều. Chữ ký của context switching:
+máy không làm xong việc gì trước, nó làm dở dang tất cả.
+
+Và RSS 1,0 → 4,0 GB **dù `memory_limit` mỗi worker giảm** từ 3 GB xuống 1,5 GB.
+64 luồng, mỗi luồng cần buffer riêng. **Thread không miễn phí về RAM** — một
+khoản `memory_limit` không đếm.
+
+### 6.2 Overcommit — 8×1, mem 12 GB (hứa 96 GB trên máy 16 GB)
+
+Chạy êm. **Peak RSS 1,1 GB.** Máy không hề hấn gì.
+
+`memory_limit` là **trần, không phải chỗ đã đặt**. DuckDB không giữ trước RAM,
+nó xin khi cần. 7 ngày, mỗi worker 1 luồng, streaming CSV → parquet — khối lượng
+thật chỉ ~140 MB/worker, nên trần 12 GB hay 1,5 GB không khác gì nhau.
+
+Overcommit là một lời hứa, và lời hứa chỉ bị đòi khi có ai thực sự cần. Nó sẽ nổ
+ở query phải giữ dữ liệu trong bộ nhớ: hash join lớn, sort toàn bộ, window trên
+cả bảng — tức là chính cái committer làm.
+
+Bất ngờ thứ hai: **62,0 s, chậm hơn cả 8×8.** Với 1 luồng/worker, 06-19 mất
+**61 s** và một mình định ra vạch đích; 7 worker kia xong từ giây 29 rồi ngồi
+chơi. Đây mới là straggler thật sự.
+
+---
+
+## Task 7 — Single query: một process, một query, cả danh sách file
+
+| era | files | wall | rows |
+|---|---|---|---|
+| v1 | 45 | 18,2 s | 2.773.013 |
+| v2 | 16 | 8,6 s → 3,7 s (`--relax`) | 849.030 → 907.417 |
+| v3 | 8 | 3,2 s | 435.594 |
+
+`2.773.013 + 907.417 + 435.594 = 4.116.024` — **đúng bằng pool**. Và chênh hai
+lần chạy v2 là `907.417 − 849.030 = 58.387`, chính xác con số pool báo cho 07-22.
+Hai đường độc lập, ba lần cắt khác nhau, khớp tới từng dòng. Đây là một **oracle**
+để kiểm chéo, không chỉ một phép đo tốc độ.
+
+| | wall |
+|---|---|
+| pool 4×2, 69 ngày | **16,0 s** |
+| single query, ba era cộng lại | 25,1 s |
+
+Pool thắng. Single query gần đúng bằng tuần tự.
+
+Ba thứ học được khi viết nó:
+
+- **`_data_date` sụp khi một query nuốt 45 file.** Pool có nó miễn phí vì mỗi
+  worker biết mình đang làm ngày nào. Ở đây thông tin đó chỉ còn nằm ở tên file →
+  `filename=true` rồi `CAST(filename[-14:-5] AS DATE)`. Lát cắt DuckDB đếm từ 1
+  và lấy cả hai đầu, khác Python.
+- **Phải chèn vào cả hai tầng.** `ALIGN` và `CANON` đều liệt kê cột tường minh;
+  chèn một tầng thôi thì SQL vẫn chạy và cột biến mất không một lời nào.
+- **`store_rejects` áp cho toàn bộ danh sách.** Một `read_csv` ăn 16 file thì
+  không có chỗ nào nói "riêng file này đọc khác". Hai nước, cả hai tệ hơn pool:
+  bật relax cho cả era (mất strict cho 15 file lành), hoặc loại ngày hỏng ra
+  (thiếu một ngày). Chọn loại ra: thà thiếu một ngày còn hơn nới luật cho 15 ngày.
+
+**Cảnh báo về con số 3,7 s:** nó chạy *sau* lần 8,6 s trên cùng 16 file nên ăn
+trọn cache đĩa còn nóng. Đừng đọc là "relax nhanh hơn 2,3×". Đúng cái bẫy
+"tin một phép đo đơn lẻ", gặp ngay trong dữ liệu của chính mình.
+
+Chọn single query khi: một era, không file gãy, cần code ngắn, chấp nhận
+restatement. Chọn pool khi: nhiều era, có ngày lỗi, cần retry từng ngày và state
+trong `ops.etl_runs` — tức gần như mọi lúc trong production.
+
+---
+
+## Task 8 — Skew và thứ tự xử lý
+
+| bối cảnh | `--order date` | `--order size` | chênh |
+|---|---|---|---|
+| small, 69 ngày, 4×2 | 16,0 s | 16,3 s | **0%** |
+| full, 7 ngày, 4×2 | 35,3 s | 29,6 s | **−16%** |
+
+Cùng một tối ưu, cùng một cấu hình, hai kết quả trái ngược. Công thức:
+
+> `--order size` ăn tiền khi (thời gian ngày to − ngày thường) lớn so với tổng
+> wall. Small/69 ngày: 0,9 s trên 16 s ≈ 6%, hàng đợi 17 ngày/worker tự cân bằng.
+> Full/7 ngày: 19 s trên 35 s, mỗi worker chỉ 2 ngày — không còn gì để cân bằng,
+> thứ tự trở thành tất cả.
+
+Nói ngắn: **hàng đợi càng nông, thứ tự càng quan trọng.** Backfill dài tự lo
+được; backfill ngắn thì không.
+
+Xếp theo `bytes` chứ không theo `rows`: chi phí staging là chi phí đọc và parse
+văn bản, mà cái đó tỉ lệ với byte. Một ngày nhiều dòng ngắn rẻ hơn một ngày ít
+dòng nhưng `items` JSON dài.
+
+*(Về cache: lần chạy sau nhanh hơn, mà `size` là lần sau — nếu có thiên vị thì
+nó thiên vị có lợi cho `size`, vậy mà vẫn hoà ở small. Kết luận chắc thêm.)*
+
+---
+
+## Task 9 — Full scale, 69 ngày
+
+```
+stage 4×2 --order size : 233,9 s   peak RSS 1,2 GB
+  staged 82.320.994 / manifest 82.337.467 → dropped 16.473
+commit                 : 418,7 s
+  core.orders_par 81.063.548, _data_date 69 / 0
+```
+
+| | s |
+|---|---|
+| stage | 233,9 |
+| commit | **418,7** |
+| **tổng** | **652,6** |
+| A11 baseline | 1.004,9 |
+| **speedup** | **1,54×** |
+
+**Không đạt đích 3×.** Ghi con số này trước khi sửa gì — một lần chạy trung thực
+không đạt đích có giá trị hơn một lần chạy đạt đích sau khi đã biết đáp án.
+
+Ba câu chẩn đoán:
+
+- **Nghẽn đĩa?** Không — stage 233,9 s cho 24 GB CSV, peak RSS 1,2 GB, CPU có việc.
+- **Quá ít worker?** Không — 4×2 là cấu hình tốt nhất đo được.
+- **Committer nuốt hết?** **Đúng.** Nó được trọn 8 GB/8 luồng mà vẫn 418,7 s, chiếm
+  **64% tổng thời gian** và hoàn toàn tuần tự. Đúng như Task 4 đã cảnh báo ở small.
+
+Vì sao một `row_number()` mất 418 s: nó phải **sắp xếp 82 triệu dòng theo
+`order_id`** để gom các bản sao — một phép toàn cục.
+
+Hướng sửa (chưa làm): nếu hai bản của cùng một `order_id` luôn có cùng
+`order_date` — bản gốc ngày D và correction ngày D+3 vẫn thuộc về đơn hàng ngày
+D — thì `PARTITION BY order_id` không bao giờ cần nhìn xuyên qua ranh giới
+`order_date`, và phép sắp xếp toàn cục kia là thừa.
+
+---
+
+## Ghi chú kỹ thuật
+
+**Windows spawn.** Process con khởi động bằng cách **re-import** file. Kéo theo:
+`SCALE` phải là biến module-level (parse ở `__main__` thì con không thấy);
+`load_day()` phải ở top-level (con tìm theo tên, không nhận closure); code khởi
+động pool phải nằm dưới `if __name__ == "__main__"`, bỏ đi là bom fork.
+
+**`enable_progress_bar=false` trong worker.** DuckDB tự vẽ thanh tiến trình khi
+query chạy >2 s và stdout là terminal. Với N worker, N thanh cùng ghi vào **một**
+stdout — dòng chèn lẫn nhau, và con số elapsed cạnh một ngày lại thuộc về worker
+khác. Log song song phải do một process in. *(Đã gặp trong thực tế ở lần chạy 8×1:
+dòng `100% ?███...?` chen ngang giữa hai ngày.)*
+
+**Một file mỗi ngày, không `PARTITION_BY` trong worker.** Ngày D mang correction
+cho D−7..D, nên hai worker sẽ cùng ghi vào thư mục `order_date=...` và đè lặng lẽ
+file của nhau — đúng cái bẫy A02. Không chia sẻ thư mục = không cần khoá. Việc
+partition để committer làm, một mình.
+
+Cùng câu lệnh `PARTITION_BY` đó lại **an toàn** trong single query của Task 7, vì
+ở đó chỉ có một writer trên đời. Kỹ thuật không tốt hay xấu — nó đúng hoặc sai
+tuỳ số writer.
+
+**Committer lấy trọn 8 GB / 8 luồng.** Một job song song có nhiều **pha**, và mỗi
+pha được ăn cả máy. Chia 4 GB cho committer chỉ vì "worker cũng cần" là chia cho
+những process đã chết.
+
+**`PARTITION BY order_id`** — cột VARCHAR `'ORD-...'` mà A10 chuẩn hoá, không phải
+`order_id_num`. Đây là chỗ A10 trả lãi: correction era v3 mang id `'ORD-0000123456'`
+phải rơi cùng nhóm với bản gốc v1 mang id `123456`.
