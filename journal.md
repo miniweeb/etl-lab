@@ -2323,3 +2323,39 @@ những process đã chết.
 **`PARTITION BY order_id`** — cột VARCHAR `'ORD-...'` mà A10 chuẩn hoá, không phải
 `order_id_num`. Đây là chỗ A10 trả lãi: correction era v3 mang id `'ORD-0000123456'`
 phải rơi cùng nhóm với bản gốc v1 mang id `123456`.
+
+# A13 — Resource monitoring & optimization
+
+Tự viết một cái monitor bọc quanh process (psutil), rồi dùng nó để trả lời 5 câu: pipeline đang tốn gì, spill nằm ở đâu, biên OOM ở đâu, Parquet đỡ IO bao nhiêu, và cỡ máy đúng thì đáng bao nhiêu tiền.
+
+---
+
+## Số liệu
+
+| Task | Kết quả |
+|---|---|
+| 1 — build monitor | peak RSS 0,3GB, 7 mẫu, CPU 4% |
+| 2 — SQL trên monitor.csv | khớp resmon, đỉnh RSS ở giây đầu |
+| 3 — seq vs pool | seq 1 ngày: 23s/0,96GB. Pool 7 ngày: 27,4s/0,98GB, đọc 2,25GB. Ngân sách giấy 12GB, thực tế dùng 1GB |
+| 4 — spill lab (8/4/1GB) | 8GB: 691,5s, spill 15,7GB. 4GB: 933,8s, spill 19GB. 1GB: OOM sạch, spill 20,3GB |
+| 5 — spill nằm đâu + blast radius | 5 file, 0,27GB, đúng chỗ (`small/tmp`), PASS. Ổ C còn 6,8GB free → 0 lần chạy song song là an toàn |
+| 6 — near-OOM cliff (pandas) | 0,63GB/ngày → 69 ngày ≈ 43GB. Guard chặn sau 2 ngày, chặn vì RAM hệ thống cạn |
+| 7 — IO: CSV vs Parquet | CSV đọc 10,49GB, Parquet đọc 0,04GB — ít hơn 267 lần |
+| 8 — right-size | chạy 2 lần, biên OOM y nguyên cả 2: 512MB ok / 256MB chết |
+| 9 — tiền | tốc độ (A12) +$14/năm, xuống tier máy nhỏ +$13/năm |
+
+---
+
+## Rút ra được gì
+
+**Monitor phải cache object `Process`, không tạo mới mỗi lần đo.** `cpu_percent()` so với lần gọi trước trên cùng object — object mới toanh luôn báo 0%, trông như máy đang rảnh trong khi 8 core đang cháy.
+
+**IO byte đọc không đổi theo cache.** Chạy 2 lần cùng file CSV ra cùng số 10,49GB — cache Windows chỉ làm nhanh hơn về *thời gian*, không đổi số byte đã "xin" đọc. Số giống nhau là dấu hiệu đo đúng, không phải bug.
+
+**Spill trên Windows trốn kỹ.** File tạm hiện 0MB trên Explorer suốt lúc query chạy, vì NTFS chỉ cập nhật size khi đóng handle mà DuckDB giữ mở tới cuối query. Muốn thấy size thật phải hỏi `duckdb_temporary_files()` trực tiếp từ engine.
+
+**Clean OOM khác kiểu chết bẩn.** DuckDB hết bộ nhớ thì tự dừng gọn (exception, máy vẫn sống) — 1GB limit ở Task 4 chết kiểu này. Pandas thì cứ ăn RAM tới khi hệ thống nghẹt, cần guard rail riêng chặn trước (RSS của mình + RAM còn trống của máy).
+
+**Số giây tuyệt đối ở workload ngắn không đáng tin, biên ok/OOM mới đáng tin.** Sweep right-size chạy 2 lần ra 2 bộ số giây khác hẳn nhau (do nhiễu, không phải do cache order như đoán ban đầu) — nhưng ranh giới 512MB ok / 256MB chết giữ nguyên cả 2 lần. Đó là tín hiệu chắc, số giây chỉ là nhiễu.
+
+**Tune xong thì quy ra tiền mới thuyết phục được ai.** A12 nhanh hơn tiết kiệm $14/năm; máy vừa cỡ 512MB nên xuống tier rẻ hơn, thêm $13/năm. Giá $0,4/h chỉ là ước lượng — quan trọng là thói quen tính, không phải số tuyệt đối.
