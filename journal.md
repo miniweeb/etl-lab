@@ -2359,3 +2359,98 @@ Tự viết một cái monitor bọc quanh process (psutil), rồi dùng nó đ�
 **Số giây tuyệt đối ở workload ngắn không đáng tin, biên ok/OOM mới đáng tin.** Sweep right-size chạy 2 lần ra 2 bộ số giây khác hẳn nhau (do nhiễu, không phải do cache order như đoán ban đầu) — nhưng ranh giới 512MB ok / 256MB chết giữ nguyên cả 2 lần. Đó là tín hiệu chắc, số giây chỉ là nhiễu.
 
 **Tune xong thì quy ra tiền mới thuyết phục được ai.** A12 nhanh hơn tiết kiệm $14/năm; máy vừa cỡ 512MB nên xuống tier rẻ hơn, thêm $13/năm. Giá $0,4/h chỉ là ước lượng — quan trọng là thói quen tính, không phải số tuyệt đối.
+
+# A14 — Performance tuning: đo → giải thích → sửa → đo lại
+
+Nhận lại một job "chạy đúng nhưng chậm". Đo nó, xếp hạng lỗi theo giây đo được (không theo cảm giác), sửa từng cái một, chứng minh mỗi lần sửa không làm hỏng gì.
+
+---
+
+## 1. Đã làm gì
+
+| Task | Việc | Kết quả |
+|---|---|---|
+| 1 | Dựng cái đồng hồ (warmup + median 3 + fetchall) | COLD 11,5ms > bench 6,1/5,4ms, chênh 11,9% — đồng hồ dùng được |
+| 2 | 3 cách lọc cùng 1 ngày | small: 116/23/6,3ms — full: 2528/86,4/11,4ms, A chậm hơn C 221× |
+| 3 | Làm quen badpipe, chưa sửa | small TOTAL 60,07s (validate 99,1%) — full TOTAL 2314,45s (validate 99,5%) |
+| 4 | Sửa 6 fix, từng cái một, kiểm EXCEPT sau mỗi lần | small 60,07s → 0,10s (600×) |
+| 5 | Đối đầu full scale | full 2314,45s → 0,42s (5.510×), EXCEPT 2 chiều = 0 ở cả 2 scale |
+| 6 | Row group & zone map | nhóm nhỏ đánh thuế mọi query ~4×; sắp xếp + nhóm lành mạnh làm lọc 1 cửa hàng nhanh 36× |
+| 7 | Skew theo ngày | small: 1,0x thời gian cho 3,1x dòng — full: hướng đúng (spike luôn chậm hơn) nhưng độ lớn nhiễu 4x-9x, không hội tụ |
+| 8 | Viết `perf_checklist.md` + dọn dẹp | 8 con số tự đo, 4 mục theo đề, dọn ~8GB thí nghiệm |
+
+Code mới: `work/a14_performance/{a14_bench,a14_bootstrap,a14_badpipe,a14_fastpipe,a14_explore}.py`, `work/a14_performance/perf_checklist.md`.
+
+---
+
+## 2. Cái đồng hồ phải tự nghi ngờ trước khi tin
+
+Query nhỏ (~10ms ở small) thì % chênh giữa 2 lần bench dao động mạnh chỉ vì nhiễu hệ thống — chạy 3 lần liên tiếp mới ra được lần COLD rõ ràng chậm hơn (11,5ms vs 6,1/5,4ms). Bài học: không phải mọi lần benchmark đều "đúng ngay từ đầu" — phải tự kiểm cái đồng hồ trước khi tin số nó báo, và ở query quá nhỏ, kiên nhẫn chạy lại quan trọng hơn cố diễn giải một con số nhiễu.
+
+---
+
+## 3. Ba cách lọc, một câu trả lời, chênh nhau 200 lần
+
+`order_date = DATE '...'` (lọc trên cột partition) luôn thắng vì cả file không liên quan không bao giờ được mở — `EXPLAIN ANALYZE` in thẳng ra `Scanning Files: 1/237`. `CAST(order_ts AS DATE)` trông vụng nhưng optimizer viết lại thành phép so khoảng, zone map cứu được — chỉ chậm hơn C vài lần, không phải hàng trăm lần. `strftime(order_ts, '%Y-%m-%d')` giấu cột trong hàm chuỗi mà không optimizer nào nhìn xuyên qua — mọi file bị mở, mọi dòng bị định dạng lại, chậm hơn C tới 221× ở full.
+
+N=237 (tổng số file trong lake) giữ nguyên giữa 2 scale — vì số file phụ thuộc số lần APPEND của A10, không phụ thuộc scale.
+
+---
+
+## 4. Xếp hạng lỗi bằng số đo, không bằng cảm giác
+
+Badpipe có 7 lỗi, nhưng chỉ 1 chiếm 99%+ thời gian: vòng lặp Python chạy 60k lệnh `INSERT` đơn lẻ trong bước `validate`. Mấy lỗi "bắt mắt" — `SELECT DISTINCT *`, `strftime`, `ORDER BY` — cộng lại chưa tới 1% tổng thời gian. Nếu bắt đầu sửa từ chỗ thú vị trước, sẽ tốn cả buổi để tiết kiệm nửa giây.
+
+7 lỗi: (1) vòng lặp Python từng dòng INSERT — validate, 59,50s; (2) lọc `strftime` thay vì cột partition — slice; (3) `DISTINCT` thừa; (4) `ORDER BY` không ai yêu cầu; (5) `SELECT *` kéo `items`/`meta` qua mọi bước; (6) `LEFT JOIN customers` không dùng gì; (7) `ROW_GROUP_SIZE 5000` quá nhỏ.
+
+---
+
+## 5. Sửa từng cái một, đo sau mỗi lần, kiểm EXCEPT sau mỗi lần
+
+| Fix | TOTAL (small) | Việc |
+|---|---|---|
+| gốc (badpipe) | 60,07s | — |
+| 1 | 0,48s | loop → 1 câu SQL |
+| 2 | 0,35s | lọc `order_date` thay `strftime` |
+| 3 | 0,27s | xoá DISTINCT + ORDER BY (đã chứng minh vô dụng: 59.706 = 59.706 qua DISTINCT) |
+| 4 | 0,23s | gọi tên 6 cột hợp đồng — file giảm 3,89MB → 1,38MB |
+| 5 | 0,17s | bỏ LEFT JOIN customers |
+| 6 | 0,10s | `ROW_GROUP_SIZE` 5000 → 122880 |
+
+EXCEPT 2 chiều (`old-new`, `new-old`) trả về 0 sau **mỗi** lần sửa, cả `orders` (so đúng 6 cột hợp đồng) và `store_daily` (so `*`). Fix 1 mua về nhiều giây nhất — đúng như xếp hạng ở Task 3 dự đoán.
+
+---
+
+## 6. Full scale: khoảng cách thật, không phải khoảng cách đoán
+
+| Scale | badpipe | fastpipe | speedup |
+|---|---|---|---|
+| small | 60,07s | 0,10s | 600× |
+| full | 2314,45s | 0,42s | **5.510×** |
+
+Vượt xa mục tiêu tối thiểu 20×. EXCEPT chạy lại ở full — vẫn 0 cả 2 chiều, kể cả khi 3 era + dữ liệu trễ mà small có thể che giấu. DISTINCT vẫn vô dụng ở full (1.193.931 = 1.193.931).
+
+---
+
+## 7. Row group và zone map: hai núm vặn trả giá lúc ghi, thu lãi lúc đọc
+
+Ghi: file nhóm nhỏ (rg5000) và có sắp xếp là chậm nhất — 298,5s ở full, so với 24,1s của nhóm lành mạnh không sắp xếp.
+
+Đọc, full scale:
+
+| Biến thể | Nhóm | Quét-hết | Lọc 1 cửa hàng |
+|---|---|---|---|
+| rg5000 (nhỏ), không sắp | 13.424 | 3634,9ms | 3000,6ms |
+| rg122880 (lành mạnh), không sắp | 668 | 939,0ms | 827,8ms |
+| rg122880, sắp theo store_id | 670 | 784,6ms | **25,7ms** |
+| rg5000, sắp | 13.399 | 3020,3ms | 376,4ms |
+
+Nhóm nhỏ đánh thuế **mọi** query (~4×) vì mỗi nhóm có chi phí cố định riêng — kể cả câu quét-hết không lọc gì. Sắp xếp không giúp gì cho quét-hết (vẫn phải đọc hết byte), nhưng với nhóm lành mạnh thì lọc 1 cửa hàng nhanh **36 lần** — zone map bỏ qua gần hết 668 nhóm. Nhìn tận mắt: nhóm 0 chỉ chứa store 1-16, nhóm 1 chỉ 16-22... khoảng hẹp = bỏ qua được; file không sắp thì mọi nhóm đều chứa store 42.
+
+Áp cùng kỹ thuật lên partition ngày spike (06-19, full): 30 nhóm, lọc 1 cửa hàng 11,4ms (plain) → 3,4ms (sorted). Đây là lý do một job viết lại partition (kiểu atomic swap A09) sẽ thêm `ORDER BY store_id` nếu lọc theo cửa hàng là đường nóng — chỉ sắp xếp vật lý được một kiểu, phải dành đúng cho bộ lọc dùng nhiều nhất.
+
+Khi nào đặt row group nhỏ lại là đúng: khi cần ghi liên tục theo lô nhỏ (streaming/near-real-time) và freshness quan trọng hơn tốc độ đọc — đổi lại mọi query đọc sau đó trả thêm phí ~4× suốt vòng đời file.
+
+---
+
+## 8. Skew theo ngày: scale nhỏ xếp hạng được, không đo cỡ được
