@@ -24,13 +24,65 @@
 #
 # Cell 6 và cell 11 ở full scale chạy vài phút và khoá notebook trong lúc đó.
 
+# # %%
+# # ─────────────────────────────────────────────────────────────────────────────
+# # CELL 1 — SETUP. Leo về repo root (mẫu A08/A09/A10/A12).
+# # ─────────────────────────────────────────────────────────────────────────────
+# import os
+# from pathlib import Path
+
+# p = Path.cwd()
+# while not (p / "lib" / "labpaths.py").exists():
+#     if p.parent == p:
+#         raise RuntimeError("Không tìm thấy repo root (lib/labpaths.py). "
+#                            "Mở VS Code ở thư mục ETL/ rồi chạy lại.")
+#     p = p.parent
+# os.chdir(p)
+# print("cwd:", Path.cwd())
+
+# import shutil                                                   # noqa: E402
+# import threading                                                # noqa: E402
+# import time                                                     # noqa: E402
+
+# import duckdb                                                   # noqa: E402
+# import psutil                                                   # noqa: E402
+
+# from work.a13_resource_monitoring.a13_bootstrap import (         # noqa: E402
+#     GB, LAKE, PROBE_DAY, RAW, SCALE, SWEEP, TMP, duck, os_drive, section)
+
+# print("SCALE =", SCALE, " (đổi bằng $env:ETL_LAB_SCALE rồi mở LẠI VS Code)")
+# print("tmp   =", TMP, "->", "TRỐNG" if not any(TMP.glob("*")) else "CÒN FILE")
+# print("ổ tmp =", TMP.drive, "vs ổ OS", os_drive())
+
+# # Schema era v1, đọc thô. Mấy cell hôm nay không làm sạch gì — mục tiêu là ép
+# # engine làm việc nặng, không phải dựng lại pipeline.
+# COLS_V1 = ("{'order_id':'BIGINT','customer_id':'BIGINT','store_id':'INTEGER',"
+#            "'order_ts':'VARCHAR','updated_at':'TIMESTAMP','status':'VARCHAR',"
+#            "'payment_method':'VARCHAR','order_total':'VARCHAR',"
+#            "'items':'VARCHAR','meta':'VARCHAR'}")
+
 # %%
 # ─────────────────────────────────────────────────────────────────────────────
 # CELL 1 — SETUP. Leo về repo root (mẫu A08/A09/A10/A12).
+#
+# ĐỔI SCALE Ở ĐÂY. Kernel VS Code đọc biến môi trường lúc KHỞI ĐỘNG, nên gõ
+# $env:ETL_LAB_SCALE trong terminal sau khi kernel đã chạy thì nó không ăn.
+# Đặt ngay trong cell, TRƯỚC mọi import của work.*, rồi Restart kernel.
+#   Task 1, 2, 4b -> "small"      Task 3, 4, 5, 6, 7 -> "full"
 # ─────────────────────────────────────────────────────────────────────────────
+WANT_SCALE = "full"
+
 import os
 from pathlib import Path
 
+os.environ["ETL_LAB_SCALE"] = WANT_SCALE
+#   Phải đứng trước import a13_bootstrap: SCALE trong đó đọc env ở thời điểm
+#   import, và một module đã import rồi thì đổi env sau cũng vô ích.
+import sys
+for m in [k for k in sys.modules if k.startswith("work.a13")]:
+    del sys.modules[m]
+#   Ép Python import lại a13_bootstrap để nó đọc env vừa đặt. Không có dòng
+#   này thì `import` chỉ trả về module đã nằm sẵn trong bộ nhớ, kèm SCALE cũ.
 p = Path.cwd()
 while not (p / "lib" / "labpaths.py").exists():
     if p.parent == p:
@@ -50,9 +102,17 @@ import psutil                                                   # noqa: E402
 from work.a13_resource_monitoring.a13_bootstrap import (         # noqa: E402
     GB, LAKE, PROBE_DAY, RAW, SCALE, SWEEP, TMP, duck, os_drive, section)
 
-print("SCALE =", SCALE, " (đổi bằng $env:ETL_LAB_SCALE rồi mở LẠI VS Code)")
+if SCALE != WANT_SCALE:
+    raise RuntimeError(
+        f"SCALE = {SCALE} nhưng bạn muốn {WANT_SCALE}. Module a13_bootstrap đã "
+        f"được import từ trước với scale cũ. RESTART KERNEL rồi chạy lại cell này.")
+    #   Không cảnh báo suông mà DỪNG HẲN: chạy nhầm scale thì cell 6 mất vài
+    #   phút rồi cho ra một bảng phẳng lì, và bạn tưởng mình đã đo.
+
+print("SCALE =", SCALE)
 print("tmp   =", TMP, "->", "TRỐNG" if not any(TMP.glob("*")) else "CÒN FILE")
 print("ổ tmp =", TMP.drive, "vs ổ OS", os_drive())
+print("watcher phải canh:", TMP)
 
 # Schema era v1, đọc thô. Mấy cell hôm nay không làm sạch gì — mục tiêu là ép
 # engine làm việc nặng, không phải dựng lại pipeline.
@@ -60,7 +120,6 @@ COLS_V1 = ("{'order_id':'BIGINT','customer_id':'BIGINT','store_id':'INTEGER',"
            "'order_ts':'VARCHAR','updated_at':'TIMESTAMP','status':'VARCHAR',"
            "'payment_method':'VARCHAR','order_total':'VARCHAR',"
            "'items':'VARCHAR','meta':'VARCHAR'}")
-
 # %%
 # ─────────────────────────────────────────────────────────────────────────────
 # CELL 2 — Task 1: smoke test resmon. TERMINAL (nó bọc một lệnh khác).
@@ -76,7 +135,13 @@ nửa giây. nprocs = 1 ở đây là ĐÚNG — lệnh này không đẻ con; T
     CPU từ lần gọi trước TRÊN CÙNG đối tượng, nên đối tượng mới báo 0 mãi mãi.
   - cộng cả cây: tiến trình cha của pool A12 nằm ở ~0.2 GB trong khi các con ôm
     hàng gigabyte.""")
-
+# %%
+import os
+from pathlib import Path
+print("cwd:", os.getcwd())
+print("có file?", Path("work/mon_test.csv").exists())
+for p in Path(os.getcwd()).rglob("mon_test.csv"):
+    print("thấy ở:", p)
 # %%
 # ─────────────────────────────────────────────────────────────────────────────
 # CELL 3 — Task 2: dogfooding. Monitor nhả CSV, mà bạn sống bằng nghề đọc CSV.
@@ -292,7 +357,7 @@ print("tí này cũng sống một phần ba trên đĩa.")
 # cái thí nghiệm của bạn.
 # ─────────────────────────────────────────────────────────────────────────────
 section("Task 4b(b) — nếu spill rơi xuống ổ C: thì sao?")
-SPILL_GB = 6.0        # <-- đỉnh spill ĐO ĐƯỢC ở cell 6, lần chạy giới hạn 1GB
+SPILL_GB = 20.34        # <-- đỉnh spill ĐO ĐƯỢC ở cell 6, lần chạy giới hạn 1GB
 
 free_gb = shutil.disk_usage(os_drive() + "\\").free / GB
 print(f"{os_drive()} còn trống {free_gb:.1f} GB")
@@ -474,9 +539,9 @@ chưa bao giờ vượt giới hạn nhỏ nhất — bạn đo được đúng 
 # ─────────────────────────────────────────────────────────────────────────────
 section("Task 8 — tiền")
 PRICE_HR, RUNS_YEAR = 0.40, 365     # VM 8 core / 16 GB on-demand, giá đứng thay
-A11_WALL_S = 3600.0                 # <-- wall clock backfill A11, từ journal
-A12_WALL_S = 900.0                  # <-- wall clock (stage + commit) A12
-FITS_GB = 4.0                       # <-- đáp án cell 11
+A11_WALL_S = 1004.9                 # <-- wall clock backfill A11, từ journal
+A12_WALL_S = 652.6                  # <-- wall clock (stage + commit) A12
+FITS_GB = 0.5                       #(512MB, không phải 4.0 như mẫu đề)
 
 saved_hr = (A11_WALL_S - A12_WALL_S) / 3600
 print(f"(1) TỐC ĐỘ: {A11_WALL_S / 3600:.2f}h -> {A12_WALL_S / 3600:.2f}h "
@@ -506,3 +571,7 @@ Sau mỗi lần chạy, mấy file duckdb_temp_storage_*.tmp phải biến mất
 giây. Còn sót nghĩa là có query chết mà chưa dọn, hoặc còn tiến trình đang giữ.
 Chính chuyện chúng biến mất nhanh như vậy là lý do sự cố đầy ổ đĩa lại vô hình
 trong mọi lần chạy thử nhỏ — và là lý do cell 7 phải ASSERT thay vì liếc nhìn.""")
+
+# %%
+con.close()
+# %%
