@@ -1,0 +1,42 @@
+# TODO(you) — A15 Task 10. Bốn model stg_shopcore__*, cộng seed country_map
+# dưới khoá seeds: trong cùng file này. CHỈ mô tả, không test.
+#
+# Hai sự thật BẮT BUỘC phải nằm trong mô tả, chính xác vì không người đọc nào
+# suy ra được từ SQL:
+#   - stg_shopcore__customers.email_hash tồn tại do điều khoản phân loại dữ
+#     liệu của A06. Địa chỉ thô bị CỐ TÌNH không select, không phải vô tình thiếu.
+#   - dim_products.unit_price là giá niêm yết HÔM NAY, còn
+#     fct_order_items.unit_price là số tiền đơn đó THẬT SỰ bị tính.
+# Cả hai đúng là kiểu câu-query-sai-đang-chờ-xảy-ra mà catalog sinh ra để ngăn.
+version: 2
+
+models:
+  - name: stg_shopcore__orders
+    description: >
+      One row per order version as delivered. Thin layer — A10 already aligned
+      the three schema eras and did the heavy cleaning before the lake; this
+      only fixes enums and drops the technical orders_v partition column.
+
+  - name: stg_shopcore__customers
+    description: >
+      One row per customer, cleaned. email_hash exists because of A06's data
+      classification clause — the raw email is deliberately not selected, not
+      accidentally missing.
+    columns:
+      - name: email_hash
+        description: MD5 hash of the lowercased, trimmed email. Never the raw address.
+
+  - name: stg_shopcore__products
+    description: >
+      One row per SKU, unit_price cleaned to DECIMAL(10,2). This is today's list
+      price, different from fct_order_items.unit_price, which is what that order
+      was actually charged.
+
+  - name: stg_shopcore__stores
+    description: One row per store, ids and dates cast to proper types.
+
+seeds:
+  - name: country_map
+    description: >
+      Spelling variant to ISO2 country code mapping, versioned with the code
+      (A03's country conformance table, formalized as a dbt seed).

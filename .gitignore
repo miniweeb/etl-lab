@@ -22,3 +22,7 @@ logs/
 
 work/mon_*.csv
 work/profile.json
+
+dbt_lab/target/
+dbt_lab/logs/
+dbt_lab/dbt_packages/

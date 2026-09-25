@@ -1,0 +1,24 @@
+# A15 Task 1 — dựng Ở ĐÂU. Tách khỏi dbt_project.yml vì phần "cái gì" thì cả
+# đội dùng chung, còn phần "ở đâu" thì mỗi máy một khác.
+
+etl_lab_dbt:
+  target: small
+  outputs:
+    small:
+      type: duckdb
+      path: "{{ env_var('ETL_LAB_DATA') }}/small/warehouse/warehouse.duckdb"
+      threads: 4
+      settings:
+        memory_limit: 8GB
+        threads: 8
+        timezone: UTC
+        preserve_insertion_order: false
+    full:
+      type: duckdb
+      path: "{{ env_var('ETL_LAB_DATA') }}/warehouse/warehouse.duckdb"
+      threads: 4
+      settings:
+        memory_limit: 12GB
+        threads: 2
+        timezone: UTC
+        preserve_insertion_order: false

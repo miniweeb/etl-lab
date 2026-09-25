@@ -1,0 +1,35 @@
+# A15 Task 1 
+name: etl_lab_dbt
+version: "1.0.0"
+profile: etl_lab_dbt
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+# Tham số lúc chạy = cặp --start/--end của runner A11.
+# Mặc định bằng TOÀN BỘ lịch sử là lựa chọn an toàn: quên truyền var thì bị
+# dựng lại thừa, chứ không bị nạp thiếu.
+vars:
+  start_date: "2026-06-01"
+  end_date: "2026-08-08"
+
+# Khối này là CHÍNH SÁCH: mọi thứ trong models/staging/ thành view ở schema
+# staging, v.v. Đó là quy ước phân tầng của A03, giờ được chính cấu trúc thư
+# mục cưỡng chế thay vì dựa vào trí nhớ.
+models:
+  etl_lab_dbt:
+    staging:
+      +materialized: view
+      +schema: staging
+    core:
+      +materialized: table
+      +schema: core
+    marts:
+      +materialized: table
+      +schema: marts
+
+seeds:
+  etl_lab_dbt:
+    +schema: staging

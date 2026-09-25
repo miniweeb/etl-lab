@@ -1,0 +1,32 @@
+# A15 Task 10 — CHỈ mô tả, không test, để TOTAL=25 không xê dịch.
+
+version: 2
+
+models:
+  - name: daily_store_sales
+    description: >
+      Mỗi dòng là một bộ (order_date, store_id, currency) — hiệu quả bán của
+      từng cửa hàng theo ngày. Currency nằm trong grain là CỐ Ý: cộng USD với
+      VND thành một số là lời nói dối gấp 25.000 lần, đúng vết sẹo A10 mà mart
+      này từ chối lặp lại.
+    columns:
+      - name: gross_revenue
+        description: >
+          Tổng `fct_orders.order_total` theo ngày, cửa hàng và tiền tệ. ĐÃ BAO
+          GỒM đơn huỷ và đơn hoàn tiền; doanh thu thuần là câu hỏi khác và sẽ
+          là một mart khác.
+      - name: customers
+        description: >
+          Số khách PHÂN BIỆT trong một ô. KHÔNG ADDITIVE — cộng nó qua bảy ngày
+          KHÔNG ra số khách phân biệt của cả tuần.
+      - name: orders_missing_total
+        description: >
+          Số đơn có tổng tiền không parse được thành số. Đưa ra thành cột chứ
+          không giấu đi — nó là phần chú thích về mẫu số cho `avg_order_value`.
+
+  # TODO(you) — thêm mô tả cho category_daily_revenue sau khi viết model.
+      - name: category_daily_revenue
+        description: >
+          One row per (order_date, category, currency) — revenue by product category
+          per day. Built from fct_order_items LEFT JOIN dim_products, so orphan SKUs
+          (about 0.2%, A04) land visibly in a NULL category instead of vanishing.

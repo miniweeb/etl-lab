@@ -1,0 +1,82 @@
+# A15 Task 7 — contract thành test, và Task 10 — mô tả thành catalog.
+# Cú pháp dbt >= 1.12: khoá là data_tests:, test có tham số thì lồng dưới arguments:.
+#
+# Mỗi mục biên dịch ra một câu SELECT bắt buộc trả về 0 DÒNG. dbt lưu chúng
+# dưới target/compiled/ — mở ra đọc, chúng y hệt mấy query A05 của bạn.
+version: 2
+
+models:
+  - name: fct_orders
+    description: >
+      Mỗi dòng là một đơn hàng, schema canonical, đã áp bản sửa mới nhất. Dựng
+      từ lake bằng cách giữ bản có `updated_at` cao nhất cho mỗi `order_id_num`,
+      nên một đơn được sửa ở file sau chỉ xuất hiện một lần, ở trạng thái cuối.
+      Dựng lại theo cửa sổ ngày (delete+insert), nên nạp lại dải ngày nào cũng
+      an toàn.
+    columns:
+      - name: order_id
+        description: >
+          Khoá đơn hàng canonical, tiền tố `ORD-` cộng số 10 chữ số đệm 0. Ổn
+          định qua cả ba era — id dạng số của v1/v2 đã được định dạng lại về
+          hình này ở A10 để bản sửa của v3 khớp được với lịch sử v1.
+        data_tests: [not_null, unique]
+      - name: order_id_num
+        data_tests: [not_null]
+      - name: order_date
+        description: >
+          Ngày nghiệp vụ của đơn, dẫn xuất từ `order_ts` đã làm sạch. Đây là
+          khoá phân vùng của lake VÀ là khoá delete+insert của model này — nạp
+          lại một dải ngày sẽ thay thế đúng bằng ấy dòng.
+        data_tests: [not_null]
+      - name: status
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['created', 'paid', 'shipped', 'delivered',
+                         'cancelled', 'refunded']
+      - name: store_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_stores')
+                field: store_id
+      - name: customer_id
+        description: >
+          Khách đặt đơn; khoá ngoại về `dim_customers`. NULL ở đây CÓ NGHĨA —
+          contract nói đó là mua không đăng nhập, không phải dữ liệu thiếu.
+          ~0,05% id là mồ côi (rác đã ghi nhận từ A05), và đó là lý do phép
+          kiểm quan hệ chỉ CẢNH BÁO chứ không làm đỏ.
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('dim_customers')
+                field: customer_id
+              config:
+                severity: warn
+                # Một test cứ đỏ vì rác ĐÃ BIẾT sẽ dạy người ta làm ngơ màu đỏ.
+                # warn = đã biết và đang theo dõi; error = dừng dây chuyền.
+      - name: currency
+        description: >
+          Mã tiền tệ ISO của `order_total` và giá các dòng hàng. ĐỪNG BAO GIỜ
+          cộng xuyên tiền tệ — VND lớn hơn USD chừng 25.000 lần, và đó là lý do
+          mọi mart trong dự án này đều mang currency trong grain.
+
+  - name: dim_customers
+    description: Mỗi dòng một khách. email_hash thay cho email thô — điều khoản PII của A06.
+    columns:
+      - name: customer_id
+        data_tests: [not_null, unique]
+
+  - name: dim_products
+    description: >
+      Mỗi dòng một SKU. `unit_price` là GIÁ NIÊM YẾT HÔM NAY, khác với
+      `fct_order_items.unit_price` là số tiền đơn đó thật sự bị tính.
+    columns:
+      - name: sku
+        data_tests: [not_null, unique]
+
+  - name: dim_stores
+    description: >
+      Mỗi dòng một cửa hàng. Nguồn thô ổn định, chỉ cần cast kiểu — không có
+      logic làm sạch nào ở tầng này.

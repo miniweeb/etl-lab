@@ -1,0 +1,37 @@
+# A15 Task 2 — source: lời khai về dữ liệu dbt ĐỌC nhưng KHÔNG dựng.
+#
+# Một bên gửi thì một source. shopcore gửi bốn luồng, nên chúng là bốn BẢNG nằm
+# dưới MỘT source, không phải bốn source. Nhờ vậy source('shopcore', ...) đọc
+# lên giống sơ đồ tổ chức: cái tên trả lời câu "gọi ai đây?".
+version: 2
+
+sources:
+  - name: shopcore
+    description: >
+      Mọi luồng từ shopcore: luồng orders (canonical Parquet lake dựng ở A10,
+      vá ở A11) cộng các file CSV dimension đúng y như lúc nhận, bẩn có chủ đích.
+    # {name} một-ngoặc là chỗ trống của dbt-duckdb, điền bằng tên từng bảng —
+    # một dòng phục vụ cả ba CSV dimension. meta ở mức BẢNG thắng mức source,
+    # nhờ đó một source trải được lên cả Parquet lake lẫn CSV.
+    # all_varchar=true là CỐ Ý: A03 dạy rằng tầng làm sạch đọc cột bẩn dưới
+    # dạng chuỗi để nhìn thấy được thứ mình đang sửa.
+    meta:
+      external_location: >-
+        read_csv('{{ env_var('ETL_LAB_DATA') }}{{ '/small' if target.name == 'small'
+        else '' }}/raw/dims/{name}.csv', header=true, all_varchar=true)
+    tables:
+      - name: orders
+        description: Mỗi dòng một sự kiện đơn hàng, schema canonical, đủ ba era.
+        meta:
+          external_location: >-
+            read_parquet('{{ env_var('ETL_LAB_DATA') }}{{ '/small' if target.name ==
+            'small' else '' }}/lake/orders_v=*/*/*.parquet', hive_partitioning=true)
+        loaded_at_field: updated_at
+        # Điều khoản freshness của A06, ở dạng CHẠY ĐƯỢC. Feed này dừng thật vào
+        # 2026-08-08 nên tuỳ ngày bạn chạy mà ra WARN hay ERROR — cả hai đều đúng.
+        freshness:
+          warn_after: {count: 24, period: hour}
+          error_after: {count: 7, period: day}
+      - name: customers
+      - name: products
+      - name: stores
